@@ -2,7 +2,6 @@ from typing import TypedDict
 
 
 class PlanTask(TypedDict, total=False):
-
     id: int
     title: str
     description: str
@@ -14,13 +13,11 @@ class PlanTask(TypedDict, total=False):
 
 
 class RepositoryFile(TypedDict):
-
     path: str
     content: str
 
 
 class TestResults(TypedDict, total=False):
-
     success: bool
     return_code: int
     stdout: str
@@ -28,7 +25,6 @@ class TestResults(TypedDict, total=False):
 
 
 class DebuggerResult(TypedDict, total=False):
-
     diagnosis: str
     errors: list[str]
     files_to_fix: list[str]
@@ -37,39 +33,68 @@ class DebuggerResult(TypedDict, total=False):
 
 
 class AgentState(TypedDict, total=False):
+    # ---------------------------------------------------------
+    # User request
+    # ---------------------------------------------------------
 
-    # User input
     user_request: str
     repository_path: str
 
+    # ---------------------------------------------------------
     # Repository analysis
+    # ---------------------------------------------------------
+
     repository_summary: str
     relevant_files: list[str]
     repository_files: list[RepositoryFile]
 
+    # Structured repository architecture
+    repository_architecture: dict
+    architecture_summary: str
+
+    # ---------------------------------------------------------
     # Planning
+    # ---------------------------------------------------------
+
     plan: list[PlanTask]
     plan_summary: str
 
-    # Execution
+    # ---------------------------------------------------------
+    # Current workflow state
+    # ---------------------------------------------------------
+
     current_task_id: int
     current_step: str
 
-    # Coder
+    # ---------------------------------------------------------
+    # Code generation
+    # ---------------------------------------------------------
+
     generated_files: list[str]
     modified_files: list[str]
 
+    # ---------------------------------------------------------
     # Testing
+    # ---------------------------------------------------------
+
     test_results: TestResults
 
+    # ---------------------------------------------------------
     # Debugging
-    debugger_result: DebuggerResult
+    # ---------------------------------------------------------
 
-    # Future agents
+    debugger_result: DebuggerResult
+    debug_retry_count: int
+
+    # ---------------------------------------------------------
+    # Reviews
+    # ---------------------------------------------------------
+
     review_results: dict
 
-    # Error handling
-    errors: list[str]
+    # ---------------------------------------------------------
+    # Errors / final response
+    # ---------------------------------------------------------
 
-    # Final response
+    errors: list[str]
     final_response: str
