@@ -18,9 +18,7 @@ def get_llm():
             f"Unsupported LLM provider: {provider}"
         )
 
-    api_key = os.getenv(
-        "GROQ_API_KEY"
-    )
+    api_key = os.getenv("GROQ_API_KEY")
 
     if not api_key:
         raise ValueError(
@@ -36,9 +34,5 @@ def get_llm():
         model=model,
         api_key=api_key,
         temperature=0,
-        model_kwargs={
-            "response_format": {
-                "type": "json_object"
-            }
-        },
+        max_retries=3,
     )
