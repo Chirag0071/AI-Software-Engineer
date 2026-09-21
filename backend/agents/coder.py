@@ -3,240 +3,428 @@ import time
 
 from backend.graph.state import AgentState
 from backend.llm import get_llm
-from backend.tools.filesystem import (
-    read_file,
-    write_file,
-)
+from backend.tools.filesystem import read_file, write_file
+
+
+MAX_FILE_CONTEXT = 4000
+MAX_TOTAL_CONTEXT = 7000
+
+MAX_CODER_RETRIES = 2
+RATE_LIMIT_WAIT_SECONDS = 20
 
 
 CODER_SYSTEM_PROMPT = """
 You are the Coder Agent in an autonomous software engineering system.
 
-Your job is to implement ONE approved task from an implementation plan.
+Implement the assigned software engineering task inside the existing repository.
 
-Return ONLY valid JSON.
-
-Required JSON format:
-
-{
-  "files": [
-    {
-      "path": "relative/path",
-      "action": "create",
-      "content": "complete file content"
-    }
-  ],
-  "summary": "short summary"
-}
+Your response MUST follow the provided structured JSON schema.
 
 Rules:
 
-1. Implement ONLY the assigned task.
-2. Create ONLY files listed in files_to_create.
-3. Modify ONLY files listed in files_to_modify.
-4. For "create", return the COMPLETE file.
-5. For "modify", return the COMPLETE resulting file.
-6. Do not return patches.
-7. Do not use markdown.
-8. Do not use code fences.
-9. Never modify .env.
-10. Never expose secrets.
-11. Preserve the existing architecture.
-12. Do not invent unnecessary dependencies.
-13. If no file needs to be changed, return an empty files array.
-14. Return valid JSON only.
+1. Return only the structured JSON object.
+2. Never use Markdown code fences.
+3. Return COMPLETE file contents.
+4. Never return partial code.
+5. Only modify files explicitly allowed by the current task.
+6. Never modify .env.
+7. Never expose secrets or API keys.
+8. Preserve the existing project architecture.
+9. Reuse existing modules whenever possible.
+10. Do not rename files.
+11. Do not invent files.
+12. Do not modify unrelated files.
+13. Ensure imports are correct.
+14. Ensure generated Python is syntactically valid.
+15. Implement only the current task.
 """
 
 
-MAX_FILE_CONTEXT = 12_000
-MAX_TOTAL_CONTEXT = 20_000
-MAX_RETRIES = 2
-
-
-def clean_response(content) -> str:
-    """
-    Convert the LLM response into a clean JSON string.
-    """
-
-    if content is None:
-        return ""
-
-    if isinstance(content, list):
-
-        parts = []
-
-        for item in content:
-
-            if isinstance(item, dict):
-
-                parts.append(
-                    item.get(
-                        "text",
-                        ""
-                    )
-                )
-
-            else:
-
-                parts.append(
-                    str(item)
-                )
-
-        content = "".join(parts)
-
-    content = str(
-        content
-    ).strip()
-
-    if not content:
-        return ""
-
-    if content.startswith("```json"):
-
-        content = content[
-            len("```json"):
-        ]
-
-    elif content.startswith("```"):
-
-        content = content[
-            len("```"):
-        ]
-
-    if content.endswith("```"):
-
-        content = content[
-            :-len("```")
-        ]
-
-    return content.strip()
-
-
-def read_task_context(
-    repository_path: str,
+def build_file_context(
     task: dict,
+    repository_files: list[dict],
 ) -> str:
     """
-    Read only files that the current task
-    is allowed to modify.
+    Build a compact repository context.
+
+    Files directly involved in the current task
+    are placed first.
     """
 
-    files_to_modify = task.get(
+    allowed_files = set()
+
+    for path in task.get(
         "files_to_modify",
+        [],
+    ):
+        allowed_files.add(
+            path.replace("\\", "/")
+        )
+
+    for path in task.get(
+        "files_to_create",
+        [],
+    ):
+        allowed_files.add(
+            path.replace("\\", "/")
+        )
+
+    prioritized = []
+    remaining = []
+
+    for file_data in repository_files:
+
+        path = file_data.get(
+            "path",
+            "",
+        ).replace("\\", "/")
+
+        if path in allowed_files:
+            prioritized.append(
+                file_data
+            )
+        else:
+            remaining.append(
+                file_data
+            )
+
+    ordered_files = (
+        prioritized
+        + remaining
+    )
+
+    sections = []
+    total_size = 0
+
+    for file_data in ordered_files:
+
+        path = file_data.get(
+            "path",
+            "",
+        )
+
+        content = file_data.get(
+            "content",
+            "",
+        )
+
+        if not path:
+            continue
+
+        if total_size >= MAX_TOTAL_CONTEXT:
+            break
+
+        if len(content) > MAX_FILE_CONTEXT:
+            content = (
+                content[:MAX_FILE_CONTEXT]
+                + "\n[FILE TRUNCATED]"
+            )
+
+        remaining_size = (
+            MAX_TOTAL_CONTEXT
+            - total_size
+        )
+
+        if len(content) > remaining_size:
+            content = (
+                content[:remaining_size]
+                + "\n[CONTEXT TRUNCATED]"
+            )
+
+        sections.append(
+            f"""
+FILE: {path}
+
+{content}
+"""
+        )
+
+        total_size += len(content)
+
+    return "\n".join(
+        sections
+    )
+
+
+def build_coder_prompt(
+    state: AgentState,
+    task: dict,
+    repair_mode: bool = False,
+) -> str:
+    """
+    Build the Coder prompt.
+    """
+
+    repository_files = state.get(
+        "repository_files",
         [],
     )
 
-    if not files_to_modify:
+    mode = (
+        "REPAIR MODE"
+        if repair_mode
+        else "NORMAL IMPLEMENTATION MODE"
+    )
 
-        return (
-            "No existing files need to be read."
+    debugger_section = ""
+
+    if repair_mode:
+
+        debugger = state.get(
+            "debugger_result",
+            {},
         )
 
-    context_parts = []
-    total_size = 0
+        debugger_section = f"""
+DEBUGGER RESULT
+===============
 
-    for relative_path in files_to_modify:
+Diagnosis:
+{debugger.get("diagnosis", "")}
 
-        if relative_path == ".env":
-            continue
+Errors:
+{json.dumps(
+    debugger.get("errors", []),
+    indent=2,
+)}
 
-        try:
+Files to fix:
+{json.dumps(
+    debugger.get("files_to_fix", []),
+    indent=2,
+)}
 
-            content = read_file(
-                repository_path,
-                relative_path,
-            )
+Fix instructions:
+{json.dumps(
+    debugger.get("fix_instructions", []),
+    indent=2,
+)}
 
-            if len(content) > MAX_FILE_CONTEXT:
+Severity:
+{debugger.get("severity", "")}
+"""
 
-                content = (
-                    content[:MAX_FILE_CONTEXT]
-                    + "\n[FILE TRUNCATED]"
-                )
+    context = build_file_context(
+        task,
+        repository_files,
+    )
 
-            file_text = (
-                f"===== FILE: {relative_path} =====\n\n"
-                f"{content}"
-            )
+    return f"""
+CODER MODE
+==========
 
-            if (
-                total_size
-                + len(file_text)
-                > MAX_TOTAL_CONTEXT
-            ):
-                break
+{mode}
 
-            context_parts.append(
-                file_text
-            )
+USER REQUIREMENT
+================
 
-            total_size += len(
-                file_text
-            )
+{state.get("user_request", "")}
 
-        except FileNotFoundError:
+CURRENT TASK
+============
 
-            # The file might have been created
-            # by an earlier task.
-            continue
+Task ID:
+{task.get("id")}
 
-    if not context_parts:
+Title:
+{task.get("title")}
 
-        return (
-            "No existing file contents are available."
-        )
+Description:
+{task.get("description", "")}
 
-    return "\n\n".join(
-        context_parts
+Files to modify:
+{json.dumps(
+    task.get("files_to_modify", []),
+    indent=2,
+)}
+
+Files to create:
+{json.dumps(
+    task.get("files_to_create", []),
+    indent=2,
+)}
+
+Dependencies:
+{json.dumps(
+    task.get("dependencies", []),
+    indent=2,
+)}
+
+{debugger_section}
+
+EXISTING FILE CONTEXT
+=====================
+
+{context}
+
+IMPLEMENTATION REQUIREMENTS
+===========================
+
+1. Implement ONLY the current task.
+
+2. Modify ONLY files listed in files_to_modify.
+
+3. Create ONLY files listed in files_to_create.
+
+4. For every modified file, return its COMPLETE file content.
+
+5. For every created file, return its COMPLETE file content.
+
+6. Do not modify unrelated files.
+
+7. Do not modify .env.
+
+8. Do not expose secrets.
+
+9. Preserve the existing architecture.
+
+10. Make all imports valid.
+
+11. Make all Python syntax valid.
+
+12. Return every required file in the structured response.
+"""
+
+
+def build_coder_schema() -> dict:
+    """
+    Build the JSON schema used by the Coder.
+
+    Groq/LangChain function-based structured output
+    requires a top-level title.
+    """
+
+    return {
+        "title": "CoderResponse",
+        "type": "object",
+        "properties": {
+            "files": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                        },
+                        "action": {
+                            "type": "string",
+                            "enum": [
+                                "create",
+                                "modify",
+                            ],
+                        },
+                        "content": {
+                            "type": "string",
+                        },
+                    },
+                    "required": [
+                        "path",
+                        "action",
+                        "content",
+                    ],
+                    "additionalProperties": False,
+                },
+            },
+            "summary": {
+                "type": "string",
+            },
+        },
+        "required": [
+            "files",
+            "summary",
+        ],
+        "additionalProperties": False,
+    }
+
+
+def is_rate_limit_error(
+    error: Exception,
+) -> bool:
+    """
+    Detect Groq rate-limit errors.
+    """
+
+    message = str(error).lower()
+
+    keywords = [
+        "rate limit",
+        "rate_limit",
+        "too many requests",
+        "tokens per minute",
+        "tpm",
+        "429",
+    ]
+
+    return any(
+        keyword in message
+        for keyword in keywords
     )
 
 
-def validate_generated_files(
-    generated_files: list,
+def validate_coder_response(
+    data: dict,
     task: dict,
-) -> None:
+) -> list[dict]:
     """
-    Validate the Coder response before writing
-    anything to the repository.
+    Validate the structured Coder response
+    against the current task permissions.
     """
 
     if not isinstance(
-        generated_files,
-        list,
+        data,
+        dict,
     ):
-
         raise ValueError(
-            "Coder returned an invalid files list."
+            "Coder response must be a JSON object."
         )
 
-    allowed_create = set(
-        task.get(
-            "files_to_create",
-            [],
-        )
+    files = data.get(
+        "files"
     )
 
-    allowed_modify = set(
-        task.get(
+    if not isinstance(
+        files,
+        list,
+    ):
+        raise ValueError(
+            "Coder response must contain a files array."
+        )
+
+    allowed_modify = {
+        path.replace("\\", "/")
+        for path in task.get(
             "files_to_modify",
             [],
         )
-    )
+    }
 
-    for file_data in generated_files:
+    allowed_create = {
+        path.replace("\\", "/")
+        for path in task.get(
+            "files_to_create",
+            [],
+        )
+    }
+
+    validated = []
+    seen_paths = set()
+
+    for file_data in files:
 
         if not isinstance(
             file_data,
             dict,
         ):
-
             raise ValueError(
-                "Invalid generated file object."
+                "Each generated file must be an object."
             )
 
-        path = file_data.get(
-            "path"
-        )
+        path = str(
+            file_data.get(
+                "path",
+                "",
+            )
+        ).replace("\\", "/")
 
         action = file_data.get(
             "action"
@@ -247,287 +435,281 @@ def validate_generated_files(
         )
 
         if not path:
-
             raise ValueError(
-                "Generated file has no path."
+                "Coder returned a file without a path."
             )
 
         if path == ".env":
-
             raise ValueError(
                 "Coder cannot modify .env."
             )
+
+        if path in seen_paths:
+            raise ValueError(
+                f"Coder returned the same file twice: {path}"
+            )
+
+        seen_paths.add(path)
 
         if action not in {
             "create",
             "modify",
         }:
-
             raise ValueError(
-                f"Invalid file action: {action}"
+                f"Invalid action for {path}: {action}"
             )
+
+        if action == "modify":
+
+            if path not in allowed_modify:
+                raise ValueError(
+                    f"Unauthorized modification: {path}"
+                )
+
+        if action == "create":
+
+            if path not in allowed_create:
+                raise ValueError(
+                    f"Unauthorized file creation: {path}"
+                )
 
         if not isinstance(
             content,
             str,
         ):
-
             raise ValueError(
-                f"Invalid content for {path}"
+                f"Content for {path} must be a string."
             )
 
-        if action == "create":
+        if not content.strip():
+            raise ValueError(
+                f"Coder returned empty content for {path}."
+            )
 
-            if path not in allowed_create:
+        validated.append(
+            {
+                "path": path,
+                "action": action,
+                "content": content,
+            }
+        )
 
-                raise ValueError(
-                    (
-                        f"Coder attempted to create "
-                        f"unauthorized file: {path}"
-                    )
-                )
+    if not validated:
+        raise ValueError(
+            "Coder returned no files."
+        )
 
-        if action == "modify":
-
-            if path not in allowed_modify:
-
-                raise ValueError(
-                    (
-                        f"Coder attempted to modify "
-                        f"unauthorized file: {path}"
-                    )
-                )
+    return validated
 
 
-def execute_task(
-    repository_path: str,
-    task: dict,
-) -> tuple[list[str], list[str]]:
+def call_coder_llm(
+    prompt: str,
+) -> dict:
     """
-    Execute one implementation task.
+    Call Groq using structured JSON output.
     """
-
-    task_context = read_task_context(
-        repository_path,
-        task,
-    )
-
-    files_to_create = task.get(
-        "files_to_create",
-        [],
-    )
-
-    files_to_modify = task.get(
-        "files_to_modify",
-        [],
-    )
-
-    tests_required = task.get(
-        "tests_required",
-        [],
-    )
-
-    security_considerations = task.get(
-        "security_considerations",
-        [],
-    )
-
-    prompt = f"""
-{CODER_SYSTEM_PROMPT}
-
-TASK ID:
-{task.get("id")}
-
-TASK TITLE:
-{task.get("title")}
-
-TASK DESCRIPTION:
-{task.get("description")}
-
-FILES TO CREATE:
-{json.dumps(
-    files_to_create,
-    indent=2
-)}
-
-FILES TO MODIFY:
-{json.dumps(
-    files_to_modify,
-    indent=2
-)}
-
-TESTS REQUIRED:
-{json.dumps(
-    tests_required,
-    indent=2
-)}
-
-SECURITY CONSIDERATIONS:
-{json.dumps(
-    security_considerations,
-    indent=2
-)}
-
-CURRENT FILE CONTENT:
-
-{task_context}
-
-IMPLEMENT THE TASK NOW.
-
-Return ONLY the JSON object.
-Do not include explanations.
-"""
 
     llm = get_llm()
 
-    last_error = None
+    schema = build_coder_schema()
 
-    for attempt in range(
-        MAX_RETRIES
+    structured_llm = llm.with_structured_output(
+        schema,
+        method="json_schema",
+    )
+
+    response = structured_llm.invoke(
+        [
+            (
+                "system",
+                CODER_SYSTEM_PROMPT,
+            ),
+            (
+                "human",
+                prompt,
+            ),
+        ]
+    )
+
+    if response is None:
+        raise ValueError(
+            "Coder returned no structured response."
+        )
+
+    if isinstance(
+        response,
+        dict,
+    ):
+        return response
+
+    if hasattr(
+        response,
+        "content",
     ):
 
-        try:
+        content = response.content
 
-            response = llm.invoke(
-                prompt
-            )
+        if isinstance(
+            content,
+            dict,
+        ):
+            return content
 
-            content = clean_response(
-                response.content
-            )
+        if isinstance(
+            content,
+            str,
+        ):
+
+            content = content.strip()
 
             if not content:
-
                 raise ValueError(
                     "Coder returned an empty response."
                 )
 
-            result = json.loads(
-                content
-            )
+            try:
 
-            if not isinstance(
-                result,
-                dict,
-            ):
-
-                raise ValueError(
-                    "Coder response must be a JSON object."
+                parsed = json.loads(
+                    content
                 )
 
-            generated_files = result.get(
-                "files",
-                []
+                if not isinstance(
+                    parsed,
+                    dict,
+                ):
+                    raise ValueError(
+                        "Structured response is not an object."
+                    )
+
+                return parsed
+
+            except json.JSONDecodeError as exc:
+
+                raise ValueError(
+                    f"Coder returned invalid JSON: {exc}"
+                ) from exc
+
+    raise ValueError(
+        "Coder returned an unsupported structured response."
+    )
+
+
+def execute_task(
+    state: AgentState,
+    task: dict,
+    repair_mode: bool = False,
+):
+    """
+    Execute one Coder task.
+
+    All files are validated before any file is written.
+    """
+
+    prompt = build_coder_prompt(
+        state,
+        task,
+        repair_mode=repair_mode,
+    )
+
+    last_error = None
+
+    for attempt in range(
+        1,
+        MAX_CODER_RETRIES + 1,
+    ):
+
+        try:
+
+            response_data = call_coder_llm(
+                prompt
             )
 
-            validate_generated_files(
-                generated_files,
-                task,
+            generated_files = (
+                validate_coder_response(
+                    response_data,
+                    task,
+                )
             )
 
-            generated_paths = []
-            modified_paths = []
+            repository_path = state.get(
+                "repository_path"
+            )
 
-            # Only write files after the complete
-            # response has passed validation.
+            if not repository_path:
+                raise ValueError(
+                    "Repository path is missing."
+                )
+
+            generated = []
+            modified = []
+
+            # -------------------------------------------------
+            # VALIDATION PHASE
+            # -------------------------------------------------
+
             for file_data in generated_files:
 
-                path = file_data[
-                    "path"
-                ]
+                path = file_data["path"]
+                action = file_data["action"]
 
-                action = file_data[
-                    "action"
-                ]
+                if action == "modify":
 
-                content = file_data[
-                    "content"
-                ]
+                    read_file(
+                        repository_path,
+                        path,
+                    )
+
+                generated.append(
+                    path
+                )
+
+                if action == "modify":
+                    modified.append(
+                        path
+                    )
+
+            # -------------------------------------------------
+            # WRITE PHASE
+            # -------------------------------------------------
+
+            for file_data in generated_files:
 
                 write_file(
                     repository_path,
-                    path,
-                    content,
+                    file_data["path"],
+                    file_data["content"],
                 )
 
-                if action == "create":
-
-                    if path not in generated_paths:
-
-                        generated_paths.append(
-                            path
-                        )
-
-                else:
-
-                    if path not in modified_paths:
-
-                        modified_paths.append(
-                            path
-                        )
-
             return (
-                generated_paths,
-                modified_paths,
+                generated,
+                modified,
             )
 
         except Exception as exc:
 
             last_error = exc
 
-            if attempt < MAX_RETRIES - 1:
+            if attempt >= MAX_CODER_RETRIES:
+                break
 
-                time.sleep(1)
+            if is_rate_limit_error(exc):
 
-                # Smaller retry prompt.
-                prompt = f"""
-{CODER_SYSTEM_PROMPT}
+                wait_time = (
+                    RATE_LIMIT_WAIT_SECONDS
+                    * attempt
+                )
 
-TASK:
-{task.get("title")}
+                time.sleep(
+                    wait_time
+                )
 
-DESCRIPTION:
-{task.get("description")}
+            else:
 
-FILES TO CREATE:
-{json.dumps(files_to_create)}
+                time.sleep(2)
 
-FILES TO MODIFY:
-{json.dumps(files_to_modify)}
-
-Return a valid JSON object now.
-
-The "files" array must contain complete
-file contents for files that need to change.
-
-Return ONLY JSON.
-"""
-
-    raise last_error
-
-
-def dependencies_completed(
-    task: dict,
-    completed_tasks: set,
-) -> bool:
-    """
-    Check whether all dependencies of a task
-    have completed.
-    """
-
-    dependencies = task.get(
-        "dependencies",
-        []
-    )
-
-    completed = {
-        str(task_id)
-        for task_id in completed_tasks
-    }
-
-    return all(
-        str(dependency) in completed
-        for dependency in dependencies
+    raise RuntimeError(
+        f"Coder failed on task {task.get('id')}: "
+        f"{last_error}"
     )
 
 
@@ -535,24 +717,23 @@ def coder_agent(
     state: AgentState,
 ) -> AgentState:
     """
-    Execute all planned tasks sequentially.
+    Execute planned tasks or repair failed code.
     """
 
     plan = state.get(
         "plan",
-        []
+        [],
     )
 
     if not plan:
 
         return {
             **state,
+            "generated_files": [],
+            "modified_files": [],
             "errors": [
-                *state.get(
-                    "errors",
-                    []
-                ),
-                "No implementation plan available.",
+                *state.get("errors", []),
+                "Coder Agent: No implementation plan was provided.",
             ],
             "current_step": "coding_failed",
         }
@@ -565,12 +746,11 @@ def coder_agent(
 
         return {
             **state,
+            "generated_files": [],
+            "modified_files": [],
             "errors": [
-                *state.get(
-                    "errors",
-                    []
-                ),
-                "No repository path provided.",
+                *state.get("errors", []),
+                "Coder Agent: Repository path is missing.",
             ],
             "current_step": "coding_failed",
         }
@@ -578,25 +758,105 @@ def coder_agent(
     generated_files = list(
         state.get(
             "generated_files",
-            []
+            [],
         )
     )
 
     modified_files = list(
         state.get(
             "modified_files",
-            []
+            [],
         )
     )
 
-    completed_tasks = set()
-
-    errors = list(
-        state.get(
-            "errors",
-            []
-        )
+    debugger_result = state.get(
+        "debugger_result",
+        {},
     )
+
+    # ---------------------------------------------------------
+    # REPAIR MODE
+    # ---------------------------------------------------------
+
+    if debugger_result:
+
+        files_to_fix = debugger_result.get(
+            "files_to_fix",
+            [],
+        )
+
+        if not files_to_fix:
+
+            return {
+                **state,
+                "errors": [
+                    *state.get("errors", []),
+                    "Coder Agent: Debugger did not identify files to fix.",
+                ],
+                "current_step": "coding_failed",
+            }
+
+        repair_task = {
+            "id": state.get(
+                "current_task_id",
+                0,
+            ),
+            "title": "Repair failed implementation",
+            "description": (
+                "Repair the implementation using "
+                "the Debugger Agent analysis."
+            ),
+            "files_to_modify": files_to_fix,
+            "files_to_create": [],
+            "dependencies": [],
+        }
+
+        try:
+
+            generated, modified = execute_task(
+                state,
+                repair_task,
+                repair_mode=True,
+            )
+
+            for path in generated:
+
+                if path not in generated_files:
+                    generated_files.append(
+                        path
+                    )
+
+            for path in modified:
+
+                if path not in modified_files:
+                    modified_files.append(
+                        path
+                    )
+
+            return {
+                **state,
+                "generated_files": generated_files,
+                "modified_files": modified_files,
+                "debugger_result": {},
+                "current_step": "coding_complete",
+            }
+
+        except Exception as exc:
+
+            return {
+                **state,
+                "generated_files": generated_files,
+                "modified_files": modified_files,
+                "errors": [
+                    *state.get("errors", []),
+                    f"Coder repair failed: {exc}",
+                ],
+                "current_step": "coding_failed",
+            }
+
+    # ---------------------------------------------------------
+    # NORMAL IMPLEMENTATION MODE
+    # ---------------------------------------------------------
 
     try:
 
@@ -606,84 +866,47 @@ def coder_agent(
                 "id"
             )
 
-            if task_id is None:
-
-                raise ValueError(
-                    "Task has no ID."
-                )
-
-            # Verify dependencies.
-            if not dependencies_completed(
-                task,
-                completed_tasks,
-            ):
-
-                raise ValueError(
-                    (
-                        f"Task {task_id} has "
-                        "unfinished dependencies."
-                    )
-                )
-
-            state = {
+            task_state = {
                 **state,
                 "current_task_id": task_id,
-                "current_step": (
-                    f"coding_task_{task_id}"
-                ),
             }
 
-            task_generated, task_modified = (
-                execute_task(
-                    repository_path,
-                    task,
-                )
+            generated, modified = execute_task(
+                task_state,
+                task,
+                repair_mode=False,
             )
 
-            for path in task_generated:
+            for path in generated:
 
                 if path not in generated_files:
-
                     generated_files.append(
                         path
                     )
 
-            for path in task_modified:
+            for path in modified:
 
                 if path not in modified_files:
-
                     modified_files.append(
                         path
                     )
 
-            completed_tasks.add(
-                task_id
-            )
-
         return {
             **state,
             "generated_files": generated_files,
             "modified_files": modified_files,
-            "current_task_id": None,
             "current_step": "coding_complete",
-            "errors": errors,
         }
 
     except Exception as exc:
 
-        errors.append(
-            f"Coder error: {exc}"
-        )
-
         return {
             **state,
             "generated_files": generated_files,
             "modified_files": modified_files,
-            "current_task_id": (
-                state.get(
-                    "current_task_id"
-                )
-            ),
-            "errors": errors,
+            "errors": [
+                *state.get("errors", []),
+                f"Coder failed: {exc}",
+            ],
             "current_step": "coding_failed",
         }
