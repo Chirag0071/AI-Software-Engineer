@@ -8,14 +8,19 @@ load_dotenv()
 
 
 def get_llm():
-    provider = os.getenv("LLM_PROVIDER", "groq")
+    provider = os.getenv(
+        "LLM_PROVIDER",
+        "groq",
+    )
 
     if provider != "groq":
         raise ValueError(
             f"Unsupported LLM provider: {provider}"
         )
 
-    api_key = os.getenv("GROQ_API_KEY")
+    api_key = os.getenv(
+        "GROQ_API_KEY"
+    )
 
     if not api_key:
         raise ValueError(
@@ -24,7 +29,7 @@ def get_llm():
 
     model = os.getenv(
         "MODEL",
-        "openai/gpt-oss-20b"
+        "openai/gpt-oss-20b",
     )
 
     return ChatGroq(
