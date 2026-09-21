@@ -27,6 +27,15 @@ class TestResults(TypedDict, total=False):
     stderr: str
 
 
+class DebuggerResult(TypedDict, total=False):
+
+    diagnosis: str
+    errors: list[str]
+    files_to_fix: list[str]
+    fix_instructions: list[str]
+    severity: str
+
+
 class AgentState(TypedDict, total=False):
 
     # User input
@@ -52,6 +61,9 @@ class AgentState(TypedDict, total=False):
 
     # Testing
     test_results: TestResults
+
+    # Debugging
+    debugger_result: DebuggerResult
 
     # Future agents
     review_results: dict
