@@ -9,486 +9,532 @@ from backend.llm import get_llm
 PLANNER_SYSTEM_PROMPT = """
 You are a software engineering planning agent.
 
-Convert the user's software requirement into a practical
-implementation plan based on the repository information.
+Your job is to convert the user's software requirement into
+a practical implementation plan for the EXISTING repository.
 
-Return ONLY a JSON object.
+Return ONLY one valid JSON object.
 
-The JSON must contain:
-- summary
-- tasks
-- testing_strategy
-- security_strategy
+Required structure:
 
-Each task must contain:
-- id
-- title
-- description
-- files_to_modify
-- files_to_create
-- dependencies
-- tests_required
-- security_considerations
+{
+  "summary": "string",
+  "tasks": [
+    {
+      "id": 1,
+      "title": "string",
+      "description": "string",
+      "files_to_modify": [],
+      "files_to_create": [],
+      "dependencies": [],
+      "tests_required": [],
+      "security_considerations": []
+    }
+  ],
+  "testing_strategy": [],
+  "security_strategy": []
+}
 
-Rules:
-- Task IDs start at 1.
-- Task IDs must be sequential.
-- Dependencies must reference earlier task IDs.
-- Do not write implementation code.
-- Do not invent existing files.
-- Do not invent unnecessary libraries.
-- Never include .env.
-- Keep the plan concise and practical.
-- Return valid JSON only.
+IMPORTANT TYPE RULES:
+
+- summary must be a string.
+- tasks must be an array.
+- testing_strategy must be an array of strings.
+- security_strategy must be an array of strings.
+- files_to_modify must be an array of strings.
+- files_to_create must be an array of strings.
+- dependencies must be an array of strings.
+- tests_required must be an array of strings.
+- security_considerations must be an array of strings.
+- Dependency IDs must be strings such as ["1", "2"].
+- Never return an integer inside dependencies.
+- Never return null for an array field.
+
+REPOSITORY RULES:
+
+1. Inspect the repository architecture before creating tasks.
+2. Use ONLY files that actually exist in the repository.
+3. Use the detected entry point.
+4. If the entry point is backend/main.py, use backend/main.py.
+5. NEVER invent backend/app.py when backend/main.py exists.
+6. Reuse existing directories and modules.
+7. Create a file only when it does not already exist.
+8. If backend/auth/ exists, use backend/auth/.
+9. If backend/auth/jwt.py exists, modify it instead of creating another JWT module.
+10. If backend/auth/dependencies.py exists, modify it instead of creating another authentication dependency module.
+11. Do not create duplicate authentication modules.
+12. Do not rename existing files.
+13. Do not invent existing files.
+14. Do not include .env.
+15. Do not include secrets or API keys.
+16. Do not modify unrelated files.
+
+CRITICAL FILE CONSISTENCY RULE:
+
+If a task description says that a file must be changed,
+that file MUST appear in files_to_modify.
+
+For example:
+
+Correct:
+{
+  "description": "Modify backend/main.py to add an endpoint.",
+  "files_to_modify": ["backend/main.py"]
+}
+
+Incorrect:
+{
+  "description": "Modify backend/main.py to add an endpoint.",
+  "files_to_modify": []
+}
+
+If a task creates a file, it MUST appear in files_to_create.
+
+If a task modifies an existing file, it MUST appear in files_to_modify.
+
+Never describe changes to a file without listing that file.
+
+TASK RULES:
+
+1. Task IDs start at 1.
+2. Task IDs must be sequential.
+3. Dependencies must reference earlier task IDs.
+4. Do not write implementation code.
+5. Keep the plan concise.
+6. Every file path must match the actual repository.
+7. Do not create duplicate functionality.
+8. Tests should be planned when behavior changes.
+9. Security-sensitive functionality must include security considerations.
+10. Split large implementation work into logical tasks.
+11. A task may modify multiple related existing files.
+12. Do not put the same newly created file in multiple tasks.
+13. Do not put the same modification into multiple unrelated tasks.
+14. Return valid JSON only.
 """
 
 
-MAX_PLANNER_CONTEXT = 20_000
+MAX_PLANNER_CONTEXT = 12000
 MAX_RETRIES = 2
 
 
-def build_repository_context(
-    repository_files: list,
-) -> str:
-    """
-    Build a small repository context for the Planner.
-    """
-
-    context_parts = []
-    current_size = 0
-
-    # Give source files priority.
-    priority_extensions = {
-        ".py",
-        ".js",
-        ".ts",
-        ".tsx",
-        ".jsx",
-        ".json",
-        ".yaml",
-        ".yml",
-        ".toml",
-    }
-
-    prioritized = []
-    normal = []
-
-    for file_data in repository_files:
-
-        if not isinstance(
-            file_data,
-            dict,
-        ):
-            continue
-
-        path = file_data.get(
-            "path",
-            "",
-        )
-
-        if not path:
-            continue
-
-        if path.lower() == ".env":
-            continue
-
-        extension = ""
-
-        if "." in path:
-            extension = (
-                "."
-                + path.rsplit(
-                    ".",
-                    1
-                )[1].lower()
-            )
-
-        if extension in priority_extensions:
-            prioritized.append(
-                file_data
-            )
-        else:
-            normal.append(
-                file_data
-            )
-
-    ordered_files = (
-        prioritized + normal
-    )
-
-    for file_data in ordered_files:
-
-        path = file_data.get(
-            "path",
-            "",
-        )
-
-        content = file_data.get(
-            "content",
-            "",
-        )
-
-        # Keep individual files small.
-        if len(content) > 8_000:
-            content = (
-                content[:8_000]
-                + "\n[FILE TRUNCATED]"
-            )
-
-        file_text = (
-            f"FILE: {path}\n"
-            f"{content}\n\n"
-        )
-
-        if (
-            current_size
-            + len(file_text)
-            > MAX_PLANNER_CONTEXT
-        ):
-            break
-
-        context_parts.append(
-            file_text
-        )
-
-        current_size += len(
-            file_text
-        )
-
-    if not context_parts:
-
-        return (
-            "No repository source files "
-            "are available."
-        )
-
-    return "".join(
-        context_parts
-    )
-
-
-def clean_response(
-    content,
-) -> str:
-    """
-    Convert the LangChain response into
-    a clean JSON string.
-    """
+def clean_response(content) -> str:
+    """Clean the raw LLM response."""
 
     if content is None:
         return ""
 
-    if isinstance(
-        content,
-        list,
-    ):
-
+    if isinstance(content, list):
         parts = []
 
         for item in content:
+            if isinstance(item, str):
+                parts.append(item)
 
-            if isinstance(
-                item,
-                dict,
-            ):
-
-                text = item.get(
-                    "text",
-                    ""
-                )
+            elif isinstance(item, dict):
+                text = item.get("text")
 
                 if text:
-                    parts.append(
-                        str(text)
-                    )
+                    parts.append(str(text))
 
-            else:
+        content = "\n".join(parts)
 
-                parts.append(
-                    str(item)
-                )
+    elif not isinstance(content, str):
+        content = str(content)
 
-        content = "".join(
-            parts
-        )
+    content = content.strip()
 
-    content = str(
-        content
-    ).strip()
+    if content.startswith("```"):
+        lines = content.splitlines()
+
+        if lines:
+            lines = lines[1:]
+
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+
+        content = "\n".join(lines).strip()
+
+    return content
+
+
+def extract_json_object(content: str) -> str:
+    """Extract JSON from the model response."""
+
+    content = clean_response(content)
 
     if not content:
         return ""
 
-    # Remove markdown fences if the model
-    # accidentally adds them.
-    if content.startswith(
-        "```json"
-    ):
+    if content.startswith("{") and content.endswith("}"):
+        return content
 
-        content = content[
-            len("```json"):
-        ]
+    start = content.find("{")
+    end = content.rfind("}")
 
-    elif content.startswith(
-        "```"
-    ):
+    if start != -1 and end != -1 and end > start:
+        return content[start:end + 1]
 
-        content = content[
-            len("```"):
-        ]
+    return content
 
-    if content.endswith(
-        "```"
-    ):
 
-        content = content[
-            :-len("```")
-        ]
+def build_repository_context(
+    state: AgentState,
+) -> str:
+    """Build repository context for the Planner."""
 
-    return content.strip()
+    architecture_summary = state.get(
+        "architecture_summary",
+        "",
+    )
+
+    repository_summary = state.get(
+        "repository_summary",
+        "",
+    )
+
+    relevant_files = state.get(
+        "relevant_files",
+        [],
+    )
+
+    repository_files = state.get(
+        "repository_files",
+        [],
+    )
+
+    sections = []
+
+    if architecture_summary:
+        sections.append(
+            architecture_summary
+        )
+
+    if repository_summary:
+        sections.append(
+            f"""
+REPOSITORY SUMMARY
+==================
+
+{repository_summary}
+"""
+        )
+
+    if relevant_files:
+        sections.append(
+            """
+REPOSITORY FILE LIST
+====================
+
+"""
+            + "\n".join(
+                f"- {path.replace(chr(92), '/')}"
+                for path in relevant_files
+            )
+        )
+
+    if repository_files:
+
+        file_sections = []
+        total_size = 0
+
+        for file_data in repository_files:
+
+            path = file_data.get(
+                "path",
+                "",
+            )
+
+            content = file_data.get(
+                "content",
+                "",
+            )
+
+            if not path:
+                continue
+
+            remaining = (
+                MAX_PLANNER_CONTEXT
+                - total_size
+            )
+
+            if remaining <= 0:
+                break
+
+            if len(content) > remaining:
+                content = (
+                    content[:remaining]
+                    + "\n\n[PLANNER CONTEXT TRUNCATED]"
+                )
+
+            file_sections.append(
+                f"""
+FILE: {path}
+
+{content}
+"""
+            )
+
+            total_size += len(content)
+
+        sections.append(
+            """
+EXISTING SOURCE CONTEXT
+=======================
+
+"""
+            + "\n".join(file_sections)
+        )
+
+    return "\n".join(sections)
 
 
 def validate_plan(
-    plan: ImplementationPlan,
-) -> None:
-    """
-    Validate the generated implementation plan.
-    """
+    plan_data: dict,
+) -> ImplementationPlan:
+    """Validate the Planner output."""
 
-    if not plan.tasks:
-
+    if not isinstance(plan_data, dict):
         raise ValueError(
-            "Planner returned no tasks."
+            "Planner response must be a JSON object."
         )
 
-    task_ids = [
-        task.id
-        for task in plan.tasks
-    ]
-
-    expected_ids = list(
-        range(
-            1,
-            len(task_ids) + 1,
-        )
+    plan = ImplementationPlan.model_validate(
+        plan_data
     )
 
-    if task_ids != expected_ids:
+    return plan
 
-        raise ValueError(
-            (
-                "Task IDs must be sequential "
-                "starting from 1."
-            )
-        )
 
-    valid_ids = {
-        str(task_id)
-        for task_id in task_ids
+def validate_file_consistency(
+    plan: ImplementationPlan,
+    relevant_files: list[str],
+) -> None:
+    """
+    Make sure every file mentioned in a task description
+    is actually listed in the corresponding file list.
+
+    Also prevent duplicate file creation.
+    """
+
+    existing_files = {
+        path.replace("\\", "/")
+        for path in relevant_files
     }
+
+    created_files = set()
 
     for task in plan.tasks:
 
-        for dependency in (
-            task.dependencies
-        ):
+        modify_files = {
+            path.replace("\\", "/")
+            for path in task.files_to_modify
+        }
 
-            if dependency not in valid_ids:
+        create_files = {
+            path.replace("\\", "/")
+            for path in task.files_to_create
+        }
 
-                raise ValueError(
-                    (
-                        f"Task {task.id} has "
-                        f"invalid dependency "
-                        f"{dependency}."
-                    )
-                )
+        overlap = (
+            modify_files
+            & create_files
+        )
 
-            if int(dependency) >= task.id:
-
-                raise ValueError(
-                    (
-                        f"Task {task.id} depends "
-                        f"on task {dependency}. "
-                        "Dependencies must reference "
-                        "earlier tasks."
-                    )
-                )
-
-        if ".env" in task.files_to_modify:
-
+        if overlap:
             raise ValueError(
-                "Planner cannot modify .env."
+                "A file cannot appear in both "
+                "files_to_modify and files_to_create: "
+                f"{sorted(overlap)}"
             )
 
-        if ".env" in task.files_to_create:
+        for path in modify_files:
 
-            raise ValueError(
-                "Planner cannot create .env."
-            )
+            if path not in existing_files:
+                raise ValueError(
+                    f"Planner attempted to modify a file "
+                    f"that does not exist: {path}"
+                )
+
+        for path in create_files:
+
+            if path in existing_files:
+                raise ValueError(
+                    f"Planner attempted to create a file "
+                    f"that already exists: {path}"
+                )
+
+            if path in created_files:
+                raise ValueError(
+                    f"Planner attempted to create the same "
+                    f"file more than once: {path}"
+                )
+
+            created_files.add(path)
 
 
 def generate_plan(
-    llm,
-    prompt: str,
-):
-    """
-    Ask Groq for a plan.
+    user_request: str,
+    repository_context: str,
+    relevant_files: list[str],
+) -> ImplementationPlan:
 
-    Retries once if Groq returns an empty
-    or invalid response.
-    """
+    prompt = f"""
+USER SOFTWARE REQUIREMENT
+=========================
+
+{user_request}
+
+REPOSITORY INFORMATION
+======================
+
+{repository_context}
+
+Create a practical implementation plan.
+
+Before returning the JSON, verify:
+
+1. Every modified existing file is listed in files_to_modify.
+2. Every new file is listed in files_to_create.
+3. No existing file is listed in files_to_create.
+4. No file is both modified and created.
+5. backend/main.py is used when application endpoints must change.
+6. Existing backend/auth modules are reused.
+7. Do not invent files.
+8. Return ONLY valid JSON.
+"""
 
     last_error = None
 
     for attempt in range(
-        MAX_RETRIES
+        1,
+        MAX_RETRIES + 1,
     ):
 
         try:
 
+            llm = get_llm()
+
             response = llm.invoke(
-                prompt
+                [
+                    (
+                        "system",
+                        PLANNER_SYSTEM_PROMPT,
+                    ),
+                    (
+                        "human",
+                        prompt,
+                    ),
+                ]
             )
 
-            content = clean_response(
+            content = extract_json_object(
                 response.content
             )
 
             if not content:
-
                 raise ValueError(
-                    "Groq returned an empty response."
+                    "Planner returned an empty response."
                 )
 
-            raw_plan = json.loads(
+            data = json.loads(
                 content
             )
 
-            validated_plan = (
-                ImplementationPlan.model_validate(
-                    raw_plan
-                )
+            plan = validate_plan(
+                data
             )
 
-            validate_plan(
-                validated_plan
+            validate_file_consistency(
+                plan,
+                relevant_files,
             )
 
-            return validated_plan
+            return plan
 
         except Exception as exc:
 
             last_error = exc
 
-            if attempt < MAX_RETRIES - 1:
+            if attempt >= MAX_RETRIES:
+                break
 
-                time.sleep(1)
+            time.sleep(2)
 
-                # Retry with an even shorter
-                # instruction.
-                prompt = f"""
-{PLANNER_SYSTEM_PROMPT}
+            prompt = f"""
+The previous Planner response was invalid.
+
+Fix the problem and return ONLY valid JSON.
 
 USER REQUIREMENT:
-{prompt.split("USER REQUIREMENT:", 1)[-1]}
+{user_request}
 
-IMPORTANT:
-Return a small JSON implementation plan.
-Use as few tasks as reasonably necessary.
-Return JSON immediately.
+REPOSITORY:
+{repository_context}
+
+Remember:
+
+- Every file described as modified must be in files_to_modify.
+- Every new file must be in files_to_create.
+- Existing files cannot be created.
+- Do not invent files.
+- Use backend/main.py as the application entry point.
+- Reuse backend/auth/jwt.py.
+- Reuse backend/auth/dependencies.py.
+- Return valid JSON only.
 """
 
-    raise last_error
+    raise RuntimeError(
+        f"Planner failed after {MAX_RETRIES} attempts: "
+        f"{last_error}"
+    )
 
 
 def planner_agent(
     state: AgentState,
 ) -> AgentState:
-    """
-    Planner Agent.
 
-    Converts the user requirement and repository
-    context into a validated implementation plan.
-    """
+    user_request = state.get(
+        "user_request"
+    )
 
-    request = state.get(
-        "user_request",
-        "",
-    ).strip()
-
-    if not request:
-
+    if not user_request:
         return {
             **state,
             "plan": [],
-            "plan_summary": None,
+            "plan_summary": "",
             "errors": [
-                "No user requirement was provided."
+                *state.get("errors", []),
+                "Planner Agent: No user requirement provided.",
             ],
-            "current_step": (
-                "planning_failed"
-            ),
+            "current_step": "planning_failed",
         }
+
+    repository_context = build_repository_context(
+        state
+    )
+
+    relevant_files = state.get(
+        "relevant_files",
+        [],
+    )
 
     try:
 
-        llm = get_llm()
-
-        repository_summary = state.get(
-            "repository_summary",
-            "Repository information unavailable.",
+        implementation_plan = generate_plan(
+            user_request,
+            repository_context,
+            relevant_files,
         )
 
-        repository_files = state.get(
-            "repository_files",
-            [],
-        )
-
-        repository_context = (
-            build_repository_context(
-                repository_files
-            )
-        )
-
-        prompt = f"""
-{PLANNER_SYSTEM_PROMPT}
-
-USER REQUIREMENT:
-{request}
-
-REPOSITORY SUMMARY:
-{repository_summary}
-
-REPOSITORY CONTEXT:
-{repository_context}
-
-Create the implementation plan.
-
-Make the plan concise.
-
-Return ONLY JSON.
-"""
-
-        validated_plan = generate_plan(
-            llm,
-            prompt,
-        )
-
-        plan = [
+        plan_tasks = [
             task.model_dump()
-            for task in validated_plan.tasks
+            for task in implementation_plan.tasks
         ]
 
         return {
             **state,
-            "plan": plan,
-            "plan_summary": (
-                validated_plan.summary
-            ),
-            "current_step": (
-                "planning_complete"
-            ),
-            "errors": [],
+            "plan": plan_tasks,
+            "plan_summary": implementation_plan.summary,
+            "current_step": "planning_complete",
         }
 
     except Exception as exc:
@@ -496,11 +542,10 @@ Return ONLY JSON.
         return {
             **state,
             "plan": [],
-            "plan_summary": None,
+            "plan_summary": "",
             "errors": [
-                f"Planner error: {exc}"
+                *state.get("errors", []),
+                f"Planner Agent error: {exc}",
             ],
-            "current_step": (
-                "planning_failed"
-            ),
+            "current_step": "planning_failed",
         }
