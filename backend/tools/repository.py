@@ -9,17 +9,24 @@ IGNORED_DIRECTORIES = {
     ".pytest_cache",
 }
 
+BLOCKED_FILES = {
+    ".env",
+}
 
-def scan_repository(repository_path: str) -> list[str]:
-    """
-    Scan a repository and return relevant source files.
-    """
 
-    root = Path(repository_path)
+def scan_repository(
+    repository_path: str,
+) -> list[str]:
+
+    root = Path(
+        repository_path
+    )
 
     if not root.exists():
+
         raise FileNotFoundError(
-            f"Repository does not exist: {repository_path}"
+            f"Repository does not exist: "
+            f"{repository_path}"
         )
 
     files = []
@@ -29,9 +36,19 @@ def scan_repository(repository_path: str) -> list[str]:
         if not path.is_file():
             continue
 
-        if any(part in IGNORED_DIRECTORIES for part in path.parts):
+        if any(
+            part in IGNORED_DIRECTORIES
+            for part in path.parts
+        ):
             continue
 
-        files.append(str(path.relative_to(root)))
+        if path.name in BLOCKED_FILES:
+            continue
+
+        files.append(
+            str(
+                path.relative_to(root)
+            )
+        )
 
     return sorted(files)
