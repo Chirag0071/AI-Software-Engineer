@@ -2,6 +2,7 @@ from typing import TypedDict
 
 
 class PlanTask(TypedDict, total=False):
+
     id: int
     title: str
     description: str
@@ -12,7 +13,22 @@ class PlanTask(TypedDict, total=False):
     security_considerations: list[str]
 
 
+class RepositoryFile(TypedDict):
+
+    path: str
+    content: str
+
+
+class TestResults(TypedDict, total=False):
+
+    success: bool
+    return_code: int
+    stdout: str
+    stderr: str
+
+
 class AgentState(TypedDict, total=False):
+
     # User input
     user_request: str
     repository_path: str
@@ -20,6 +36,7 @@ class AgentState(TypedDict, total=False):
     # Repository analysis
     repository_summary: str
     relevant_files: list[str]
+    repository_files: list[RepositoryFile]
 
     # Planning
     plan: list[PlanTask]
@@ -29,10 +46,14 @@ class AgentState(TypedDict, total=False):
     current_task_id: int
     current_step: str
 
-    # Future agents
+    # Coder
     generated_files: list[str]
     modified_files: list[str]
-    test_results: dict
+
+    # Testing
+    test_results: TestResults
+
+    # Future agents
     review_results: dict
 
     # Error handling
