@@ -1,114 +1,68 @@
-import json
 import time
 
 from backend.graph.state import AgentState
 from backend.agents.planner_models import ImplementationPlan
-from backend.llm import get_llm
+from backend.llm import (
+    get_groq_client,
+    get_model,
+)
 
 
 PLANNER_SYSTEM_PROMPT = """
-You are a software engineering planning agent.
+You are the Planner Agent in an autonomous software engineering system.
 
-Your job is to convert the user's software requirement into
-a practical implementation plan for the EXISTING repository.
+Your job is to convert the user's software requirement into a practical,
+ordered implementation plan for the EXISTING repository.
 
-Return ONLY one valid JSON object.
+You are given the repository architecture and source context.
 
-Required structure:
+IMPORTANT:
 
-{
-  "summary": "string",
-  "tasks": [
-    {
-      "id": 1,
-      "title": "string",
-      "description": "string",
-      "files_to_modify": [],
-      "files_to_create": [],
-      "dependencies": [],
-      "tests_required": [],
-      "security_considerations": []
-    }
-  ],
-  "testing_strategy": [],
-  "security_strategy": []
-}
+- Return ONLY data matching the provided JSON schema.
+- Do not return Markdown.
+- Do not return explanations outside the schema.
+- Do not write implementation code.
+- Use only files that actually exist in the repository.
+- Create a file only when it does not already exist.
+- Do not invent files.
+- Do not rename files.
+- Do not include .env.
+- Do not include secrets or API keys.
 
-IMPORTANT TYPE RULES:
+FILE RULES:
 
-- summary must be a string.
-- tasks must be an array.
-- testing_strategy must be an array of strings.
-- security_strategy must be an array of strings.
-- files_to_modify must be an array of strings.
-- files_to_create must be an array of strings.
-- dependencies must be an array of strings.
-- tests_required must be an array of strings.
-- security_considerations must be an array of strings.
-- Dependency IDs must be strings such as ["1", "2"].
-- Never return an integer inside dependencies.
-- Never return null for an array field.
-
-REPOSITORY RULES:
-
-1. Inspect the repository architecture before creating tasks.
-2. Use ONLY files that actually exist in the repository.
-3. Use the detected entry point.
-4. If the entry point is backend/main.py, use backend/main.py.
-5. NEVER invent backend/app.py when backend/main.py exists.
-6. Reuse existing directories and modules.
-7. Create a file only when it does not already exist.
-8. If backend/auth/ exists, use backend/auth/.
-9. If backend/auth/jwt.py exists, modify it instead of creating another JWT module.
-10. If backend/auth/dependencies.py exists, modify it instead of creating another authentication dependency module.
-11. Do not create duplicate authentication modules.
-12. Do not rename existing files.
-13. Do not invent existing files.
-14. Do not include .env.
-15. Do not include secrets or API keys.
-16. Do not modify unrelated files.
-
-CRITICAL FILE CONSISTENCY RULE:
-
-If a task description says that a file must be changed,
-that file MUST appear in files_to_modify.
-
-For example:
-
-Correct:
-{
-  "description": "Modify backend/main.py to add an endpoint.",
-  "files_to_modify": ["backend/main.py"]
-}
-
-Incorrect:
-{
-  "description": "Modify backend/main.py to add an endpoint.",
-  "files_to_modify": []
-}
-
-If a task creates a file, it MUST appear in files_to_create.
-
-If a task modifies an existing file, it MUST appear in files_to_modify.
-
-Never describe changes to a file without listing that file.
+1. If an existing file must be changed, put it in files_to_modify.
+2. If a new file must be created, put it in files_to_create.
+3. Never put an existing file in files_to_create.
+4. Never put a file in both files_to_modify and files_to_create.
+5. Do not describe changing a file without listing it.
+6. Reuse existing authentication modules.
+7. If backend/main.py exists, use backend/main.py for application endpoints.
+8. If backend/auth/jwt.py exists, reuse it.
+9. If backend/auth/dependencies.py exists, reuse it.
+10. Do not create duplicate authentication modules.
 
 TASK RULES:
 
 1. Task IDs start at 1.
 2. Task IDs must be sequential.
-3. Dependencies must reference earlier task IDs.
-4. Do not write implementation code.
-5. Keep the plan concise.
-6. Every file path must match the actual repository.
-7. Do not create duplicate functionality.
-8. Tests should be planned when behavior changes.
-9. Security-sensitive functionality must include security considerations.
-10. Split large implementation work into logical tasks.
-11. A task may modify multiple related existing files.
-12. Do not put the same newly created file in multiple tasks.
-13. Do not put the same modification into multiple unrelated tasks.
-14. Return valid JSON only.
+3. Dependencies must reference earlier task IDs only.
+4. Split the requirement into practical implementation tasks.
+5. Include tests when behavior changes.
+6. Include security considerations for security-sensitive changes.
+7. Keep tasks concise and implementation-focused.
+8. Do not duplicate the same modification across unrelated tasks.
+9. Do not create the same file in multiple tasks.
+
+DEPENDENCY RULE:
+
+Dependencies must contain task IDs as strings.
+
+Example:
+
+["1", "2"]
+
+Never use integer dependency IDs.
 """
 
 
@@ -116,70 +70,12 @@ MAX_PLANNER_CONTEXT = 12000
 MAX_RETRIES = 2
 
 
-def clean_response(content) -> str:
-    """Clean the raw LLM response."""
-
-    if content is None:
-        return ""
-
-    if isinstance(content, list):
-        parts = []
-
-        for item in content:
-            if isinstance(item, str):
-                parts.append(item)
-
-            elif isinstance(item, dict):
-                text = item.get("text")
-
-                if text:
-                    parts.append(str(text))
-
-        content = "\n".join(parts)
-
-    elif not isinstance(content, str):
-        content = str(content)
-
-    content = content.strip()
-
-    if content.startswith("```"):
-        lines = content.splitlines()
-
-        if lines:
-            lines = lines[1:]
-
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-
-        content = "\n".join(lines).strip()
-
-    return content
-
-
-def extract_json_object(content: str) -> str:
-    """Extract JSON from the model response."""
-
-    content = clean_response(content)
-
-    if not content:
-        return ""
-
-    if content.startswith("{") and content.endswith("}"):
-        return content
-
-    start = content.find("{")
-    end = content.rfind("}")
-
-    if start != -1 and end != -1 and end > start:
-        return content[start:end + 1]
-
-    return content
-
-
 def build_repository_context(
     state: AgentState,
 ) -> str:
-    """Build repository context for the Planner."""
+    """
+    Build a compact repository context for the Planner.
+    """
 
     architecture_summary = state.get(
         "architecture_summary",
@@ -219,6 +115,11 @@ REPOSITORY SUMMARY
         )
 
     if relevant_files:
+        normalized_files = [
+            path.replace("\\", "/")
+            for path in relevant_files
+        ]
+
         sections.append(
             """
 REPOSITORY FILE LIST
@@ -226,8 +127,8 @@ REPOSITORY FILE LIST
 
 """
             + "\n".join(
-                f"- {path.replace(chr(92), '/')}"
-                for path in relevant_files
+                f"- {path}"
+                for path in normalized_files
             )
         )
 
@@ -275,33 +176,116 @@ FILE: {path}
 
             total_size += len(content)
 
-        sections.append(
-            """
+        if file_sections:
+            sections.append(
+                """
 EXISTING SOURCE CONTEXT
 =======================
 
 """
-            + "\n".join(file_sections)
-        )
+                + "\n".join(file_sections)
+            )
 
     return "\n".join(sections)
 
 
-def validate_plan(
-    plan_data: dict,
-) -> ImplementationPlan:
-    """Validate the Planner output."""
+def build_planner_schema() -> dict:
+    """
+    Native Groq strict JSON schema.
 
-    if not isinstance(plan_data, dict):
-        raise ValueError(
-            "Planner response must be a JSON object."
-        )
+    All fields are required because strict structured
+    output requires complete object definitions.
+    """
 
-    plan = ImplementationPlan.model_validate(
-        plan_data
-    )
-
-    return plan
+    return {
+        "name": "implementation_plan",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "summary": {
+                    "type": "string",
+                },
+                "tasks": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {
+                                "type": "integer",
+                            },
+                            "title": {
+                                "type": "string",
+                            },
+                            "description": {
+                                "type": "string",
+                            },
+                            "files_to_modify": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string",
+                                },
+                            },
+                            "files_to_create": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string",
+                                },
+                            },
+                            "dependencies": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string",
+                                },
+                            },
+                            "tests_required": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string",
+                                },
+                            },
+                            "security_considerations": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string",
+                                },
+                            },
+                        },
+                        "required": [
+                            "id",
+                            "title",
+                            "description",
+                            "files_to_modify",
+                            "files_to_create",
+                            "dependencies",
+                            "tests_required",
+                            "security_considerations",
+                        ],
+                        "additionalProperties": False,
+                    },
+                },
+                "testing_strategy": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                    },
+                },
+                "security_strategy": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                    },
+                },
+            },
+            "required": [
+                "summary",
+                "tasks",
+                "testing_strategy",
+                "security_strategy",
+            ],
+            "additionalProperties": False,
+        },
+    }
 
 
 def validate_file_consistency(
@@ -309,10 +293,8 @@ def validate_file_consistency(
     relevant_files: list[str],
 ) -> None:
     """
-    Make sure every file mentioned in a task description
-    is actually listed in the corresponding file list.
-
-    Also prevent duplicate file creation.
+    Validate that the Planner did not invent files,
+    duplicate files, or create existing files.
     """
 
     existing_files = {
@@ -322,7 +304,20 @@ def validate_file_consistency(
 
     created_files = set()
 
+    previous_task_ids = set()
+
     for task in plan.tasks:
+
+        task_id = task.id
+
+        if task_id in previous_task_ids:
+            raise ValueError(
+                f"Duplicate task ID: {task_id}"
+            )
+
+        previous_task_ids.add(
+            task_id
+        )
 
         modify_files = {
             path.replace("\\", "/")
@@ -350,25 +345,85 @@ def validate_file_consistency(
 
             if path not in existing_files:
                 raise ValueError(
-                    f"Planner attempted to modify a file "
-                    f"that does not exist: {path}"
+                    "Planner attempted to modify a "
+                    f"file that does not exist: {path}"
                 )
 
         for path in create_files:
 
             if path in existing_files:
                 raise ValueError(
-                    f"Planner attempted to create a file "
-                    f"that already exists: {path}"
+                    "Planner attempted to create a "
+                    f"file that already exists: {path}"
                 )
 
             if path in created_files:
                 raise ValueError(
-                    f"Planner attempted to create the same "
-                    f"file more than once: {path}"
+                    "Planner attempted to create the "
+                    f"same file more than once: {path}"
                 )
 
-            created_files.add(path)
+            created_files.add(
+                path
+            )
+
+        for dependency in task.dependencies:
+
+            if dependency not in {
+                str(previous_id)
+                for previous_id in previous_task_ids
+                if previous_id < task_id
+            }:
+                raise ValueError(
+                    f"Task {task_id} has invalid dependency "
+                    f"'{dependency}'. Dependencies must "
+                    "reference earlier task IDs."
+                )
+
+
+def validate_plan(
+    plan_data: dict,
+) -> ImplementationPlan:
+    """
+    Validate the structured Planner response
+    using the project's Pydantic models.
+    """
+
+    if not isinstance(
+        plan_data,
+        dict,
+    ):
+        raise ValueError(
+            "Planner response must be a JSON object."
+        )
+
+    plan = ImplementationPlan.model_validate(
+        plan_data
+    )
+
+    if not plan.tasks:
+        raise ValueError(
+            "Planner returned an empty task list."
+        )
+
+    task_ids = [
+        task.id
+        for task in plan.tasks
+    ]
+
+    expected_ids = list(
+        range(
+            1,
+            len(task_ids) + 1,
+        )
+    )
+
+    if task_ids != expected_ids:
+        raise ValueError(
+            "Task IDs must be sequential starting from 1."
+        )
+
+    return plan
 
 
 def generate_plan(
@@ -388,19 +443,23 @@ REPOSITORY INFORMATION
 
 {repository_context}
 
-Create a practical implementation plan.
+Create the implementation plan now.
 
-Before returning the JSON, verify:
+Before returning the structured response, verify:
 
-1. Every modified existing file is listed in files_to_modify.
-2. Every new file is listed in files_to_create.
+1. Existing files are only placed in files_to_modify.
+2. New files are only placed in files_to_create.
 3. No existing file is listed in files_to_create.
 4. No file is both modified and created.
-5. backend/main.py is used when application endpoints must change.
+5. backend/main.py is used when application endpoints change.
 6. Existing backend/auth modules are reused.
-7. Do not invent files.
-8. Return ONLY valid JSON.
+7. No .env file is included.
+8. Dependencies are strings referring to earlier task IDs.
+9. Task IDs start at 1 and are sequential.
+10. Tests are included when behavior changes.
+11. Security considerations are included where appropriate.
 """
+
 
     last_error = None
 
@@ -411,36 +470,54 @@ Before returning the JSON, verify:
 
         try:
 
-            llm = get_llm()
+            client = get_groq_client()
 
-            response = llm.invoke(
-                [
-                    (
-                        "system",
-                        PLANNER_SYSTEM_PROMPT,
-                    ),
-                    (
-                        "human",
-                        prompt,
-                    ),
-                ]
+            response = client.chat.completions.create(
+                model=get_model(),
+                messages=[
+                    {
+                        "role": "system",
+                        "content": PLANNER_SYSTEM_PROMPT,
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt,
+                    },
+                ],
+                temperature=0,
+                reasoning_effort="low",
+                max_tokens=12000,
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": build_planner_schema(),
+                },
             )
 
-            content = extract_json_object(
-                response.content
-            )
+            if not response.choices:
+                raise ValueError(
+                    "Planner received no response choices from Groq."
+                )
+
+            message = response.choices[0].message
+
+            content = message.content
 
             if not content:
                 raise ValueError(
                     "Planner returned an empty response."
                 )
 
-            data = json.loads(
+            # Native strict JSON schema should already produce
+            # valid JSON. We deliberately do not attempt fragile
+            # substring extraction here.
+            import json
+
+            plan_data = json.loads(
                 content
             )
 
             plan = validate_plan(
-                data
+                plan_data
             )
 
             validate_file_consistency(
@@ -457,30 +534,43 @@ Before returning the JSON, verify:
             if attempt >= MAX_RETRIES:
                 break
 
-            time.sleep(2)
+            time.sleep(
+                2 * attempt
+            )
 
             prompt = f"""
-The previous Planner response was invalid.
+The previous planning attempt failed validation.
 
-Fix the problem and return ONLY valid JSON.
+Return a complete implementation plan using the
+required JSON schema.
 
-USER REQUIREMENT:
+USER REQUIREMENT
+================
+
 {user_request}
 
-REPOSITORY:
+REPOSITORY INFORMATION
+======================
+
 {repository_context}
 
-Remember:
+STRICT REQUIREMENTS:
 
-- Every file described as modified must be in files_to_modify.
-- Every new file must be in files_to_create.
-- Existing files cannot be created.
-- Do not invent files.
-- Use backend/main.py as the application entry point.
-- Reuse backend/auth/jwt.py.
-- Reuse backend/auth/dependencies.py.
-- Return valid JSON only.
+- Use only files from the repository.
+- Existing files belong in files_to_modify.
+- New files belong in files_to_create.
+- Never create an existing file.
+- Never modify a nonexistent file.
+- Never include .env.
+- Use backend/main.py when application endpoints change.
+- Reuse existing backend/auth modules.
+- Task IDs start at 1.
+- Dependencies are strings.
+- Dependencies refer only to earlier task IDs.
+- Include tests for behavior changes.
+- Include security considerations where appropriate.
 """
+
 
     raise RuntimeError(
         f"Planner failed after {MAX_RETRIES} attempts: "
