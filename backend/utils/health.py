@@ -5,10 +5,12 @@ Health-check utilities for the AI Software Engineer backend.
 
 def health_check() -> dict:
     """
-    Return the current application health status.
+    Return the health status of the application.
 
-    Returns:
-        dict: Health information for the application.
+    The health-check contract intentionally contains exactly
+    two fields:
+        - status
+        - workflow
     """
 
     return {
