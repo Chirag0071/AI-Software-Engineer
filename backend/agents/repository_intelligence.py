@@ -1,11 +1,9 @@
-from pathlib import Path
-
 from backend.graph.state import AgentState
 from backend.tools.filesystem import read_file
 
 
-MAX_FILE_SIZE = 20_000
-MAX_TOTAL_CONTEXT = 30_000
+MAX_FILE_SIZE = 12_000
+MAX_TOTAL_CONTEXT = 12_000
 
 
 def detect_architecture(
@@ -13,8 +11,7 @@ def detect_architecture(
     relevant_files: list[str],
 ) -> dict:
     """
-    Detect the basic architecture of the repository
-    without using an additional LLM call.
+    Detect the main architecture of the repository.
     """
 
     normalized_files = {
@@ -34,10 +31,6 @@ def detect_architecture(
         "important_files": [],
     }
 
-    # ---------------------------------------------------------
-    # Detect application entry point
-    # ---------------------------------------------------------
-
     entry_candidates = [
         "backend/main.py",
         "backend/app.py",
@@ -46,48 +39,58 @@ def detect_architecture(
     ]
 
     for candidate in entry_candidates:
+
         if candidate in normalized_files:
+
             architecture["entry_point"] = candidate
+
             break
 
-    # ---------------------------------------------------------
-    # Categorize repository files
-    # ---------------------------------------------------------
-
-    for path in sorted(normalized_files):
+    for path in sorted(
+        normalized_files
+    ):
 
         lower_path = path.lower()
 
-        # Authentication
         if (
             "/auth/" in lower_path
             or lower_path.startswith("auth/")
         ):
-            architecture["authentication"].append(path)
 
-        # LLM
+            architecture[
+                "authentication"
+            ].append(path)
+
         if (
             lower_path.endswith("llm.py")
             or "/llm/" in lower_path
         ):
-            architecture["llm"].append(path)
 
-        # Agents
+            architecture[
+                "llm"
+            ].append(path)
+
         if "/agents/" in lower_path:
-            architecture["agents"].append(path)
 
-        # Graph / workflow
+            architecture[
+                "agents"
+            ].append(path)
+
         if (
             "/graph/" in lower_path
             or lower_path.endswith("workflow.py")
         ):
-            architecture["workflow"].append(path)
 
-        # Tools
+            architecture[
+                "workflow"
+            ].append(path)
+
         if "/tools/" in lower_path:
-            architecture["tools"].append(path)
 
-        # Tests
+            architecture[
+                "tools"
+            ].append(path)
+
         if (
             lower_path.startswith("tests/")
             or "/tests/" in lower_path
@@ -95,26 +98,31 @@ def detect_architecture(
             or "/test_" in lower_path
             or lower_path.endswith("_test.py")
         ):
-            architecture["tests"].append(path)
+
+            architecture[
+                "tests"
+            ].append(path)
 
     # ---------------------------------------------------------
-    # Detect framework from source files
+    # Detect framework
     # ---------------------------------------------------------
 
     files_to_check = []
 
     if architecture["entry_point"]:
+
         files_to_check.append(
             architecture["entry_point"]
         )
 
     files_to_check.extend(
-        architecture["agents"][:5]
+        architecture["agents"][:3]
     )
 
     for relative_path in files_to_check:
 
         try:
+
             content = read_file(
                 repository_path,
                 relative_path,
@@ -125,14 +133,18 @@ def detect_architecture(
                 or "import fastapi" in content
                 or "FastAPI(" in content
             ):
-                architecture["framework"] = "FastAPI"
+
+                architecture[
+                    "framework"
+                ] = "FastAPI"
+
                 break
 
         except Exception:
             continue
 
     # ---------------------------------------------------------
-    # Identify important architectural files
+    # Important files
     # ---------------------------------------------------------
 
     preferred_files = [
@@ -148,9 +160,14 @@ def detect_architecture(
         if (
             path
             and path in normalized_files
-            and path not in architecture["important_files"]
+            and path not in architecture[
+                "important_files"
+            ]
         ):
-            architecture["important_files"].append(path)
+
+            architecture[
+                "important_files"
+            ].append(path)
 
     return architecture
 
@@ -159,8 +176,8 @@ def build_architecture_summary(
     architecture: dict,
 ) -> str:
     """
-    Convert detected architecture into concise,
-    planner-readable text.
+    Convert architecture information into
+    a compact text summary.
     """
 
     lines = [
@@ -174,12 +191,19 @@ def build_architecture_summary(
     ]
 
     if architecture["authentication"]:
+
         lines.extend(
             f"- {path}"
-            for path in architecture["authentication"]
+            for path in architecture[
+                "authentication"
+            ]
         )
+
     else:
-        lines.append("- None detected")
+
+        lines.append(
+            "- None detected"
+        )
 
     lines.extend(
         [
@@ -189,12 +213,19 @@ def build_architecture_summary(
     )
 
     if architecture["llm"]:
+
         lines.extend(
             f"- {path}"
-            for path in architecture["llm"]
+            for path in architecture[
+                "llm"
+            ]
         )
+
     else:
-        lines.append("- None detected")
+
+        lines.append(
+            "- None detected"
+        )
 
     lines.extend(
         [
@@ -204,12 +235,19 @@ def build_architecture_summary(
     )
 
     if architecture["agents"]:
+
         lines.extend(
             f"- {path}"
-            for path in architecture["agents"]
+            for path in architecture[
+                "agents"
+            ]
         )
+
     else:
-        lines.append("- None detected")
+
+        lines.append(
+            "- None detected"
+        )
 
     lines.extend(
         [
@@ -219,12 +257,19 @@ def build_architecture_summary(
     )
 
     if architecture["workflow"]:
+
         lines.extend(
             f"- {path}"
-            for path in architecture["workflow"]
+            for path in architecture[
+                "workflow"
+            ]
         )
+
     else:
-        lines.append("- None detected")
+
+        lines.append(
+            "- None detected"
+        )
 
     lines.extend(
         [
@@ -234,12 +279,19 @@ def build_architecture_summary(
     )
 
     if architecture["tools"]:
+
         lines.extend(
             f"- {path}"
-            for path in architecture["tools"]
+            for path in architecture[
+                "tools"
+            ]
         )
+
     else:
-        lines.append("- None detected")
+
+        lines.append(
+            "- None detected"
+        )
 
     lines.extend(
         [
@@ -249,12 +301,19 @@ def build_architecture_summary(
     )
 
     if architecture["tests"]:
+
         lines.extend(
             f"- {path}"
-            for path in architecture["tests"]
+            for path in architecture[
+                "tests"
+            ]
         )
+
     else:
-        lines.append("- None detected")
+
+        lines.append(
+            "- None detected"
+        )
 
     lines.extend(
         [
@@ -264,22 +323,37 @@ def build_architecture_summary(
     )
 
     if architecture["important_files"]:
+
         lines.extend(
             f"- {path}"
-            for path in architecture["important_files"]
+            for path in architecture[
+                "important_files"
+            ]
         )
-    else:
-        lines.append("- None detected")
 
-    return "\n".join(lines)
+    else:
+
+        lines.append(
+            "- None detected"
+        )
+
+    return "\n".join(
+        lines
+    )
 
 
 def repository_intelligence(
     state: AgentState,
 ) -> AgentState:
     """
-    Analyze repository structure and collect relevant
-    source context for the Planner.
+    Analyze repository architecture and load a compact,
+    safe subset of repository files.
+
+    The Coder does not need the entire repository.
+    It needs:
+        - architecture
+        - important files
+        - files relevant to the current plan
     """
 
     repository_path = state.get(
@@ -287,16 +361,22 @@ def repository_intelligence(
     )
 
     if not repository_path:
+
         return {
             **state,
             "repository_files": [],
             "repository_architecture": {},
             "architecture_summary": "",
             "errors": [
-                *state.get("errors", []),
+                *state.get(
+                    "errors",
+                    [],
+                ),
                 "No repository path was provided.",
             ],
-            "current_step": "repository_intelligence_failed",
+            "current_step": (
+                "repository_intelligence_failed"
+            ),
         }
 
     relevant_files = state.get(
@@ -305,56 +385,137 @@ def repository_intelligence(
     )
 
     errors = list(
-        state.get("errors", [])
+        state.get(
+            "errors",
+            [],
+        )
     )
-
-    # ---------------------------------------------------------
-    # Detect repository architecture
-    # ---------------------------------------------------------
 
     architecture = detect_architecture(
         repository_path,
         relevant_files,
     )
 
-    architecture_summary = build_architecture_summary(
-        architecture
+    architecture_summary = (
+        build_architecture_summary(
+            architecture
+        )
     )
-
-    # ---------------------------------------------------------
-    # Prioritize important files
-    # ---------------------------------------------------------
 
     normalized_relevant = [
         path.replace("\\", "/")
         for path in relevant_files
     ]
 
+    # ---------------------------------------------------------
+    # Prioritize only files that are useful to the agents.
+    # ---------------------------------------------------------
+
     prioritized_files = []
 
-    for path in architecture["important_files"]:
+    for path in architecture[
+        "important_files"
+    ]:
 
         if path in normalized_relevant:
-            prioritized_files.append(path)
+
+            if path not in prioritized_files:
+
+                prioritized_files.append(
+                    path
+                )
+
+    # Current plan files are much more important than
+    # unrelated repository files.
+
+    plan = state.get(
+        "plan",
+        []
+    )
+
+    planned_files = []
+
+    for task in plan:
+
+        if not isinstance(
+            task,
+            dict,
+        ):
+            continue
+
+        for field in (
+            "files_to_modify",
+            "files_to_create",
+        ):
+
+            for path in task.get(
+                field,
+                [],
+            ):
+
+                normalized = (
+                    str(path)
+                    .replace("\\", "/")
+                )
+
+                if (
+                    normalized
+                    in normalized_relevant
+                    and normalized
+                    not in planned_files
+                ):
+
+                    planned_files.append(
+                        normalized
+                    )
+
+    # Planned files go first.
+
+    final_priority = []
+
+    for path in planned_files:
+
+        if path not in final_priority:
+
+            final_priority.append(
+                path
+            )
+
+    for path in prioritized_files:
+
+        if path not in final_priority:
+
+            final_priority.append(
+                path
+            )
+
+    # Add a small number of additional files only
+    # if context remains available.
 
     for path in normalized_relevant:
 
-        if path not in prioritized_files:
-            prioritized_files.append(path)
+        if path not in final_priority:
+
+            final_priority.append(
+                path
+            )
 
     # ---------------------------------------------------------
-    # Read repository context
+    # Read repository context.
     # ---------------------------------------------------------
 
     repository_files = []
+
     total_context_size = 0
 
-    for relative_path in prioritized_files:
+    for relative_path in final_priority:
 
         if relative_path == ".env":
+
             continue
 
         if total_context_size >= MAX_TOTAL_CONTEXT:
+
             break
 
         try:
@@ -365,6 +526,7 @@ def repository_intelligence(
             )
 
             if len(content) > MAX_FILE_SIZE:
+
                 content = (
                     content[:MAX_FILE_SIZE]
                     + "\n\n[FILE TRUNCATED]"
@@ -376,6 +538,7 @@ def repository_intelligence(
             )
 
             if len(content) > remaining_space:
+
                 content = (
                     content[:remaining_space]
                     + "\n\n[FILE TRUNCATED]"
@@ -388,7 +551,9 @@ def repository_intelligence(
                 }
             )
 
-            total_context_size += len(content)
+            total_context_size += len(
+                content
+            )
 
         except Exception as exc:
 
@@ -402,5 +567,7 @@ def repository_intelligence(
         "repository_architecture": architecture,
         "architecture_summary": architecture_summary,
         "errors": errors,
-        "current_step": "repository_intelligence_complete",
+        "current_step": (
+            "repository_intelligence_complete"
+        ),
     }
