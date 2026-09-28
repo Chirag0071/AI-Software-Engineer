@@ -54,14 +54,21 @@ class ApprovalResult(TypedDict, total=False):
     comment: str
 
 
+class GitHubResult(TypedDict, total=False):
+    status: str
+    branch: str
+    commit_sha: str
+    pr_number: int
+    pr_url: str
+    error: str
+
+
 class AgentState(TypedDict, total=False):
     user_request: str
-
     repository_path: str
 
     repository_summary: str
     relevant_files: list[str]
-
     repository_files: list[RepositoryFile]
 
     repository_architecture: dict
@@ -69,8 +76,8 @@ class AgentState(TypedDict, total=False):
 
     plan: list[PlanTask]
     plan_summary: str
-
     current_task_id: int
+
     current_step: str
 
     generated_files: list[str]
@@ -86,6 +93,7 @@ class AgentState(TypedDict, total=False):
     approval_result: ApprovalResult
     approval_required: bool
 
-    errors: list[str]
+    github_result: GitHubResult
 
+    errors: list[str]
     final_response: str
