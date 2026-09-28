@@ -5,6 +5,7 @@ import pytest
 from backend.github.client import (
     GitHubClient,
     GitHubConfig,
+    PullRequestResult,
 )
 
 
@@ -13,6 +14,7 @@ def create_client():
         token="test-token",
         owner="test-owner",
         repo="test-repo",
+        base_branch="main",
     )
 
     return GitHubClient(
@@ -119,5 +121,158 @@ def test_git_command_failure(mock_run):
     with pytest.raises(RuntimeError) as exc:
         client.get_status()
 
-    assert "Git command failed" in str(exc.value)
-    assert "fatal: test error" in str(exc.value)
+    assert "Git command failed" in str(
+        exc.value
+    )
+
+    assert "fatal: test error" in str(
+        exc.value
+    )
+
+
+def test_pull_request_result():
+    result = PullRequestResult(
+        number=42,
+        url="https://github.com/test-owner/test-repo/pull/42",
+        title="Add feature",
+        branch="ai-engineer/add-feature",
+        base_branch="main",
+    )
+
+    assert result.number == 42
+    assert result.title == "Add feature"
+    assert result.branch == (
+        "ai-engineer/add-feature"
+    )
+    assert result.base_branch == "main"
+
+
+def test_pull_request_requires_branch():
+    client = create_client()
+
+    with pytest.raises(ValueError):
+        client.create_pull_request(
+            branch_name="",
+            title="Test PR",
+        )
+
+
+def test_pull_request_requires_title():
+    client = create_client()
+
+    with pytest.raises(ValueError):
+        client.create_pull_request(
+            branch_name="test-branch",
+            title="",
+        )
+
+
+@patch(
+    "backend.github.client.urlopen"
+)
+def test_create_pull_request(
+    mock_urlopen,
+):
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(
+            self,
+            exc_type,
+            exc_value,
+            traceback,
+        ):
+            return False
+
+        def read(self):
+            return (
+                b'{"number": 42, '
+                b'"html_url": '
+                b'"https://github.com/test-owner/'
+                b'test-repo/pull/42"}'
+            )
+
+    mock_urlopen.return_value = (
+        FakeResponse()
+    )
+
+    client = create_client()
+
+    result = client.create_pull_request(
+        branch_name="ai-engineer/test-feature",
+        title="Add test feature",
+        body="Automated Pull Request.",
+    )
+
+    assert result.number == 42
+
+    assert result.url == (
+        "https://github.com/test-owner/"
+        "test-repo/pull/42"
+    )
+
+    assert result.branch == (
+        "ai-engineer/test-feature"
+    )
+
+    assert result.base_branch == "main"
+
+    mock_urlopen.assert_called_once()
+
+
+@patch(
+    "backend.github.client.urlopen"
+)
+def test_github_request_does_not_expose_token(
+    mock_urlopen,
+):
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(
+            self,
+            exc_type,
+            exc_value,
+            traceback,
+        ):
+            return False
+
+        def read(self):
+            return (
+                b'{"number": 1, '
+                b'"html_url": '
+                b'"https://github.com/test-owner/'
+                b'test-repo/pull/1"}'
+            )
+
+    mock_urlopen.return_value = (
+        FakeResponse()
+    )
+
+    client = GitHubClient(
+        repository_path=".",
+        config=GitHubConfig(
+            token="SECRET_TEST_TOKEN",
+            owner="test-owner",
+            repo="test-repo",
+            base_branch="main",
+        ),
+    )
+
+    client.create_pull_request(
+        branch_name="test-branch",
+        title="Test PR",
+    )
+
+    request = (
+        mock_urlopen.call_args.args[0]
+    )
+
+    assert (
+        request.headers.get(
+            "Authorization"
+        )
+        == "Bearer SECRET_TEST_TOKEN"
+    )
