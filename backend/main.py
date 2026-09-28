@@ -1,3 +1,19 @@
+"""
+FastAPI entry point for the Multi-Agent AI Software Engineer.
+
+Provides:
+- Health check
+- Autonomous software engineering workflow
+- Google OAuth development endpoints
+- JWT authentication
+- Admin protected endpoint
+- Run status storage
+- Human approval/rejection
+- GitHub Pull Request creation after approval
+"""
+
+from __future__ import annotations
+
 from uuid import uuid4
 
 from fastapi import (
@@ -13,15 +29,38 @@ from backend.auth.jwt import (
     create_access_token,
     verify_token,
 )
+from backend.github.client import GitHubClient
+from backend.github.pr_service import PullRequestService
+from backend.graph.state import AgentState
 from backend.graph.workflow import build_workflow
 from backend.utils.health import health_check
 
 
+# ---------------------------------------------------------------------------
+# FastAPI application
+# ---------------------------------------------------------------------------
+
 app = FastAPI(
     title="AI Software Engineer",
-    version="0.1.0",
-    description="Multi-Agent AI Software Engineering System",
+    version="1.0.0",
+    description=(
+        "Multi-Agent AI Software Engineering System"
+    ),
 )
+
+
+# ---------------------------------------------------------------------------
+# Workflow
+# ---------------------------------------------------------------------------
+
+workflow = build_workflow()
+
+
+# ---------------------------------------------------------------------------
+# In-memory run store
+# ---------------------------------------------------------------------------
+
+RUN_STORE: dict[str, AgentState] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -46,7 +85,6 @@ def get_current_user(
         return payload
 
     except Exception as exc:
-
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Could not validate credentials",
@@ -60,19 +98,21 @@ def require_role(
     required_role: str,
 ):
     """
-    Create a dependency that requires a specific user role.
+    Create a FastAPI dependency that requires
+    a specific role.
+
+    This helper intentionally remains in main.py because
+    the project's roles.py contains role-checking helpers
+    but does not define a FastAPI dependency factory.
     """
 
     def role_checker(
         user: dict = Depends(get_current_user),
     ) -> dict:
 
-        role = user.get(
-            "role"
-        )
+        role = user.get("role")
 
         if role != required_role:
-
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=(
@@ -91,36 +131,18 @@ def require_role(
 # ---------------------------------------------------------------------------
 
 class TaskRequest(BaseModel):
-    """
-    Request body for starting a new autonomous
-    software-engineering task.
-    """
-
     requirement: str
     repository_path: str
 
 
 class ApprovalRequest(BaseModel):
-    """
-    Request body for approving or rejecting a
-    workflow waiting for human approval.
-    """
-
-    approved: bool
-
+    reviewer: str = ""
     comment: str = ""
 
 
-# ---------------------------------------------------------------------------
-# Temporary workflow storage
-# ---------------------------------------------------------------------------
-
-# This is intentionally an in-memory store for the current development
-# version of the project.
-#
-# Later this should be replaced with PostgreSQL or another persistent
-# workflow-state store so that approval requests survive server restarts.
-pending_approvals: dict[str, dict] = {}
+class RejectionRequest(BaseModel):
+    reviewer: str = ""
+    comment: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -129,28 +151,112 @@ pending_approvals: dict[str, dict] = {}
 
 @app.get("/")
 def root():
-    """
-    Basic application information.
-    """
-
     return {
-        "project": "Multi-Agent AI Software Engineering System",
+        "project": (
+            "Multi-Agent AI Software Engineering System"
+        ),
         "status": "running",
-        "version": "0.1.0",
+        "version": "1.0.0",
     }
 
 
 @app.get("/health")
 def health():
-    """
-    Health-check endpoint.
-    """
-
     return health_check()
 
 
 # ---------------------------------------------------------------------------
-# Autonomous Software Engineering Workflow
+# Google OAuth login
+# ---------------------------------------------------------------------------
+
+@app.get("/auth/google/login")
+def google_login():
+    """
+    Development Google OAuth login endpoint.
+
+    A real Google OAuth integration can replace the
+    placeholder URL later without changing the route.
+    """
+
+    return {
+        "message": (
+            "Redirect to Google OAuth endpoint."
+        ),
+        "auth_url": (
+            "https://accounts.google.com/"
+            "o/oauth2/v2/auth"
+            "?client_id=YOUR_CLIENT_ID"
+            "&redirect_uri=YOUR_REDIRECT_URI"
+            "&response_type=code"
+            "&scope=openid%20email"
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Google OAuth callback
+# ---------------------------------------------------------------------------
+
+@app.get("/auth/google/callback")
+def google_callback(
+    code: str,
+):
+    """
+    Development Google OAuth callback.
+
+    The current project simulates the Google identity and
+    creates an application JWT.
+
+    A real Google token exchange can be connected later.
+    """
+
+    if not code.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Authorization code is required.",
+        )
+
+    user_info = {
+        "sub": "google-oauth-user-123",
+        "email": "user@example.com",
+        "role": "admin",
+    }
+
+    token = create_access_token(
+        user_info
+    )
+
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Protected admin endpoint
+# ---------------------------------------------------------------------------
+
+@app.get("/protected")
+def protected_route(
+    user: dict = Depends(
+        require_role("admin")
+    ),
+):
+    """
+    Example protected endpoint requiring admin role.
+    """
+
+    return {
+        "message": (
+            f"Hello, {user.get('email')}. "
+            "You have access to protected resources."
+        ),
+        "user": user,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Autonomous software engineering workflow
 # ---------------------------------------------------------------------------
 
 @app.post("/run")
@@ -158,7 +264,7 @@ def run_agent(
     request: TaskRequest,
 ):
     """
-    Execute the autonomous software-engineering workflow.
+    Execute the autonomous software engineering workflow.
 
     Workflow:
 
@@ -183,37 +289,54 @@ def run_agent(
            END    Test Agent
     """
 
-    if not request.requirement.strip():
+    requirement = request.requirement.strip()
+    repository_path = request.repository_path.strip()
 
+    if not requirement:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Requirement cannot be empty.",
+            status_code=400,
+            detail="Requirement is required.",
         )
 
-    if not request.repository_path.strip():
-
+    if not repository_path:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Repository path cannot be empty.",
+            status_code=400,
+            detail="Repository path is required.",
         )
 
-    initial_state = {
-        "user_request": request.requirement,
-        "repository_path": request.repository_path,
+    run_id = str(uuid4())
+
+    initial_state: AgentState = {
+        "user_request": requirement,
+        "repository_path": repository_path,
+        "repository_summary": "",
+        "relevant_files": [],
+        "repository_files": [],
+        "repository_architecture": {},
+        "architecture_summary": "",
+        "plan": [],
+        "plan_summary": "",
+        "current_task_id": 0,
         "current_step": "starting",
-        "errors": [],
-        "debug_retry_count": 0,
         "generated_files": [],
         "modified_files": [],
+        "test_results": {},
+        "debugger_result": {},
+        "debug_retry_count": 0,
+        "review_results": {},
+        "approval_result": {},
+        "approval_required": False,
+        "github_result": {},
+        "errors": [],
+        "final_response": "",
     }
 
     try:
-
-        workflow = build_workflow()
-
         result = workflow.invoke(
             initial_state
         )
+
+        RUN_STORE[run_id] = result
 
         current_step = result.get(
             "current_step",
@@ -249,73 +372,41 @@ def run_agent(
             {},
         )
 
-        # ---------------------------------------------------------------
-        # Create a run ID when human approval is required
-        # ---------------------------------------------------------------
-
-        run_id = None
-
-        if current_step == "waiting_for_human_approval":
-
-            run_id = str(
-                uuid4()
-            )
-
-            pending_approvals[run_id] = {
-                **result,
-                "run_id": run_id,
-            }
-
+        if current_step == (
+            "waiting_for_human_approval"
+        ):
             response_status = (
                 "waiting_for_approval"
             )
-
-        # ---------------------------------------------------------------
-        # Completed state
-        # ---------------------------------------------------------------
-
-        elif (
-            current_step == "completed"
-            and tests_passed
-            and review_status == "approved"
-            and approval_result.get(
-                "approved",
-                False,
-            )
-        ):
-
-            response_status = "completed"
-
-        # ---------------------------------------------------------------
-        # Code review approved
-        # ---------------------------------------------------------------
-
-        elif (
-            current_step == "code_review_complete"
-            and tests_passed
-            and review_status == "approved"
-        ):
-
-            response_status = "review_approved"
-
-        # ---------------------------------------------------------------
-        # Testing completed but no review state
-        # ---------------------------------------------------------------
 
         elif (
             current_step == "testing_complete"
             and tests_passed
             and not review_results
         ):
+            response_status = (
+                "testing_complete"
+            )
 
-            response_status = "testing_complete"
+        elif (
+            current_step == "code_review_complete"
+            and tests_passed
+            and review_status == "approved"
+        ):
+            response_status = (
+                "review_approved"
+            )
 
-        # ---------------------------------------------------------------
-        # Known failure states
-        # ---------------------------------------------------------------
+        elif current_step == "completed":
+            response_status = "completed"
+
+        elif current_step == "github_pr_created":
+            response_status = "completed"
 
         elif current_step in {
             "approval_blocked",
+            "human_approval_rejected",
+            "github_pr_failed",
             "code_review_failed",
             "code_review_skipped",
             "debugging_failed",
@@ -326,16 +417,10 @@ def run_agent(
             "testing_failed",
             "workflow_failed",
         }:
-
             response_status = "failed"
 
         else:
-
             response_status = "failed"
-
-        # ---------------------------------------------------------------
-        # Files analyzed
-        # ---------------------------------------------------------------
 
         files_analyzed = [
             file_data["path"]
@@ -352,15 +437,9 @@ def run_agent(
             )
         ]
 
-        # ---------------------------------------------------------------
-        # Response
-        # ---------------------------------------------------------------
-
         return {
             "run_id": run_id,
-
             "status": response_status,
-
             "step": current_step,
 
             "plan_summary": result.get(
@@ -417,6 +496,11 @@ def run_agent(
 
             "approval_result": approval_result,
 
+            "github_result": result.get(
+                "github_result",
+                {},
+            ),
+
             "errors": result.get(
                 "errors",
                 [],
@@ -425,42 +509,45 @@ def run_agent(
 
     except Exception as exc:
 
+        failed_state: AgentState = {
+            **initial_state,
+            "current_step": "workflow_failed",
+            "errors": [
+                f"Workflow error: {exc}"
+            ],
+        }
+
+        RUN_STORE[run_id] = failed_state
+
         return {
-            "run_id": None,
-
+            "run_id": run_id,
             "status": "failed",
-
             "step": "workflow_failed",
 
             "plan_summary": None,
-
             "plan": [],
 
             "repository_summary": None,
-
             "architecture_summary": None,
 
             "relevant_files": [],
-
             "files_analyzed": [],
 
             "generated_files": [],
-
             "modified_files": [],
 
             "test_results": {},
-
             "debugger_result": {},
 
             "debug_retry_count": 0,
 
             "review_results": {},
-
             "review_status": None,
 
             "approval_required": False,
-
             "approval_result": {},
+
+            "github_result": {},
 
             "errors": [
                 f"Workflow error: {exc}"
@@ -469,272 +556,259 @@ def run_agent(
 
 
 # ---------------------------------------------------------------------------
-# Human Approval
+# Get run status
 # ---------------------------------------------------------------------------
 
-@app.post("/runs/{run_id}/approval")
-def approve_run(
+@app.get("/runs/{run_id}")
+def get_run(
     run_id: str,
-    request: ApprovalRequest,
-    user: dict = Depends(
-        require_role("admin")
-    ),
 ):
-    """
-    Approve or reject a workflow waiting for human approval.
-
-    Only an authenticated admin can make the approval decision.
-
-    Current behavior:
-
-        approved=True
-            →
-        workflow becomes ready for GitHub PR creation
-
-        approved=False
-            →
-        workflow is rejected
-
-    The actual GitHub PR agent will be connected in the next stage.
-    """
-
-    stored_state = pending_approvals.get(
+    state = RUN_STORE.get(
         run_id
     )
 
-    if stored_state is None:
-
+    if state is None:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=(
-                "Workflow run was not found or "
-                "is no longer waiting for approval."
-            ),
+            status_code=404,
+            detail="Run not found.",
         )
 
-    if stored_state.get(
+    return {
+        "run_id": run_id,
+
+        "step": state.get(
+            "current_step",
+            "unknown",
+        ),
+
+        "approval_required": state.get(
+            "approval_required",
+            False,
+        ),
+
+        "approval_result": state.get(
+            "approval_result",
+            {},
+        ),
+
+        "github_result": state.get(
+            "github_result",
+            {},
+        ),
+
+        "test_results": state.get(
+            "test_results",
+            {},
+        ),
+
+        "review_results": state.get(
+            "review_results",
+            {},
+        ),
+
+        "generated_files": state.get(
+            "generated_files",
+            [],
+        ),
+
+        "modified_files": state.get(
+            "modified_files",
+            [],
+        ),
+
+        "errors": state.get(
+            "errors",
+            [],
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Human approval
+# ---------------------------------------------------------------------------
+
+@app.post("/runs/{run_id}/approve")
+def approve_run(
+    run_id: str,
+    request: ApprovalRequest,
+):
+    state = RUN_STORE.get(
+        run_id
+    )
+
+    if state is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Run not found.",
+        )
+
+    if state.get(
         "current_step"
     ) != "waiting_for_human_approval":
 
         raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
+            status_code=409,
             detail=(
-                "This workflow is not waiting "
-                "for human approval."
+                "Run is not waiting for human approval."
             ),
         )
 
-    reviewer = str(
-        user.get(
-            "email",
-            user.get(
-                "sub",
-                "admin",
-            ),
-        )
-    )
-
+    reviewer = request.reviewer.strip()
     comment = request.comment.strip()
 
-    if request.approved:
+    state["approval_required"] = False
 
-        updated_state = {
-            **stored_state,
-            "approval_required": False,
-            "approval_result": {
-                "approved": True,
-                "reviewer": reviewer,
-                "comment": comment,
-            },
-            "current_step": (
-                "approved_for_github_pr"
-            ),
-        }
-
-        pending_approvals[
-            run_id
-        ] = updated_state
-
-        return {
-            "run_id": run_id,
-            "status": "approved",
-            "step": "approved_for_github_pr",
-            "message": (
-                "Human approval received. "
-                "The workflow is ready for GitHub PR creation."
-            ),
-            "approval_result": updated_state[
-                "approval_result"
-            ],
-        }
-
-    updated_state = {
-        **stored_state,
-        "approval_required": False,
-        "approval_result": {
-            "approved": False,
-            "reviewer": reviewer,
-            "comment": comment,
-        },
-        "current_step": "approval_rejected",
+    state["approval_result"] = {
+        "approved": True,
+        "reviewer": reviewer,
+        "comment": comment,
     }
 
-    pending_approvals[
+    state["current_step"] = (
+        "human_approval_approved"
+    )
+
+    try:
+
+        github_client = GitHubClient(
+            state["repository_path"]
+        )
+
+        pr_service = PullRequestService(
+            github_client
+        )
+
+        github_result = (
+            pr_service.create_pr_from_approved_state(
+                state=state,
+                run_id=run_id,
+                reviewer=reviewer,
+                comment=comment,
+            )
+        )
+
+        state["github_result"] = (
+            github_result
+        )
+
+        if (
+            github_result.get("status")
+            == "created"
+        ):
+            state["current_step"] = (
+                "github_pr_created"
+            )
+        else:
+            state["current_step"] = (
+                "github_pr_failed"
+            )
+
+    except Exception as exc:
+
+        state["github_result"] = {
+            "status": "failed",
+            "branch": "",
+            "commit_sha": "",
+            "pr_number": 0,
+            "pr_url": "",
+            "error": str(exc),
+        }
+
+        state["current_step"] = (
+            "github_pr_failed"
+        )
+
+    RUN_STORE[run_id] = state
+
+    return {
+        "run_id": run_id,
+
+        "status": (
+            "approved"
+            if state["current_step"]
+            == "github_pr_created"
+            else "approval_complete"
+        ),
+
+        "step": state[
+            "current_step"
+        ],
+
+        "approval_result": state.get(
+            "approval_result",
+            {},
+        ),
+
+        "github_result": state.get(
+            "github_result",
+            {},
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Human rejection
+# ---------------------------------------------------------------------------
+
+@app.post("/runs/{run_id}/reject")
+def reject_run(
+    run_id: str,
+    request: RejectionRequest,
+):
+    state = RUN_STORE.get(
         run_id
-    ] = updated_state
+    )
+
+    if state is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Run not found.",
+        )
+
+    if state.get(
+        "current_step"
+    ) != "waiting_for_human_approval":
+
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Run is not waiting for human approval."
+            ),
+        )
+
+    reviewer = request.reviewer.strip()
+    comment = request.comment.strip()
+
+    state["approval_required"] = False
+
+    state["approval_result"] = {
+        "approved": False,
+        "reviewer": reviewer,
+        "comment": comment,
+    }
+
+    state["current_step"] = (
+        "human_approval_rejected"
+    )
+
+    RUN_STORE[run_id] = state
 
     return {
         "run_id": run_id,
         "status": "rejected",
-        "step": "approval_rejected",
-        "message": (
-            "Human approval was rejected. "
-            "No GitHub PR should be created."
+        "step": (
+            "human_approval_rejected"
         ),
-        "approval_result": updated_state[
+        "approval_result": state[
             "approval_result"
         ],
     }
 
 
-# ---------------------------------------------------------------------------
-# View pending approval
-# ---------------------------------------------------------------------------
-
-@app.get("/runs/{run_id}/approval")
-def get_pending_approval(
-    run_id: str,
-    user: dict = Depends(
-        require_role("admin")
-    ),
-):
-    """
-    Return the current approval information for a workflow run.
-    """
-
-    _ = user
-
-    stored_state = pending_approvals.get(
-        run_id
-    )
-
-    if stored_state is None:
-
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Workflow run was not found.",
-        )
-
-    return {
-        "run_id": run_id,
-        "step": stored_state.get(
-            "current_step"
-        ),
-        "approval_required": stored_state.get(
-            "approval_required",
-            False,
-        ),
-        "approval_result": stored_state.get(
-            "approval_result",
-            {},
-        ),
-        "review_results": stored_state.get(
-            "review_results",
-            {},
-        ),
-        "test_results": stored_state.get(
-            "test_results",
-            {},
-        ),
-        "generated_files": stored_state.get(
-            "generated_files",
-            [],
-        ),
-        "modified_files": stored_state.get(
-            "modified_files",
-            [],
-        ),
-    }
-
-
-# ---------------------------------------------------------------------------
-# Google OAuth login
-# ---------------------------------------------------------------------------
-
-@app.get("/auth/google/login")
-def google_login():
-    """
-    Start the Google OAuth flow.
-
-    This project currently uses a placeholder authorization URL.
-    Real Google credentials can be connected later.
-    """
-
-    return {
-        "message": (
-            "Redirect to Google OAuth endpoint."
-        ),
-        "auth_url": (
-            "https://accounts.google.com/"
-            "o/oauth2/v2/auth"
-            "?client_id=YOUR_CLIENT_ID"
-            "&redirect_uri=YOUR_REDIRECT_URI"
-            "&response_type=code"
-            "&scope=openid%20email"
-        ),
-    }
-
-
-# ---------------------------------------------------------------------------
-# Google OAuth callback
-# ---------------------------------------------------------------------------
-
-@app.get("/auth/google/callback")
-def google_callback(
-    code: str,
-):
-    """
-    Handle the Google OAuth callback.
-
-    Development version:
-    Google exchange is simulated.
-    """
-
-    _ = code
-
-    user_info = {
-        "sub": "google-oauth-user-123",
-        "email": "user@example.com",
-        "role": "admin",
-    }
-
-    token = create_access_token(
-        user_info
-    )
-
-    return {
-        "access_token": token,
-        "token_type": "bearer",
-    }
-
-
-# ---------------------------------------------------------------------------
-# Protected admin route
-# ---------------------------------------------------------------------------
-
-@app.get("/protected")
-def protected_route(
-    user: dict = Depends(
-        require_role("admin")
-    ),
-):
-    """
-    Example protected endpoint requiring admin role.
-    """
-
-    return {
-        "message": (
-            f"Hello, {user.get('email')}. "
-            "You have access to protected resources."
-        )
-    }
+__all__ = [
+    "app",
+    "RUN_STORE",
+    "health_check",
+    "get_current_user",
+    "require_role",
+]
