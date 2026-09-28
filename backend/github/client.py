@@ -1,25 +1,30 @@
 """
 GitHub integration utilities.
 
-This module provides the foundation for creating branches,
-committing changes, pushing branches, and creating pull
-requests.
+This module provides controlled Git and GitHub REST API
+operations for the autonomous software engineering system.
 
-GitHub operations are intentionally kept separate from the
+GitHub operations are intentionally separated from the
 LangGraph workflow so they can be tested independently.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from dotenv import load_dotenv
 
 
 load_dotenv()
+
+
+GITHUB_API_URL = "https://api.github.com"
 
 
 @dataclass
@@ -31,18 +36,28 @@ class GitHubConfig:
     token: str
     owner: str
     repo: str
+    base_branch: str = "main"
+
+
+@dataclass
+class PullRequestResult:
+    """
+    Information returned after creating a GitHub Pull Request.
+    """
+
+    number: int
+    url: str
+    title: str
+    branch: str
+    base_branch: str
 
 
 class GitHubClient:
     """
-    Client for Git and GitHub operations.
+    Client for Git and GitHub REST API operations.
 
-    The local repository is modified through Git commands.
-    GitHub-specific Pull Request creation is handled through
-    the GitHub REST API in a later step.
-
-    This class does not automatically execute any operation
-    when it is instantiated.
+    This class does not automatically perform any GitHub
+    operation when instantiated.
     """
 
     def __init__(
@@ -63,33 +78,29 @@ class GitHubClient:
         Load GitHub configuration from environment variables.
         """
 
-        token = os.getenv(
-            "GITHUB_TOKEN",
-            "",
-        ).strip()
-
-        owner = os.getenv(
-            "GITHUB_OWNER",
-            "",
-        ).strip()
-
-        repo = os.getenv(
-            "GITHUB_REPO",
-            "",
-        ).strip()
-
         return GitHubConfig(
-            token=token,
-            owner=owner,
-            repo=repo,
+            token=os.getenv(
+                "GITHUB_TOKEN",
+                "",
+            ).strip(),
+            owner=os.getenv(
+                "GITHUB_OWNER",
+                "",
+            ).strip(),
+            repo=os.getenv(
+                "GITHUB_REPO",
+                "",
+            ).strip(),
+            base_branch=os.getenv(
+                "GITHUB_BASE_BRANCH",
+                "main",
+            ).strip()
+            or "main",
         )
 
     def validate_config(self) -> None:
         """
         Validate required GitHub configuration.
-
-        Raises:
-            ValueError: If required configuration is missing.
         """
 
         missing = []
@@ -103,6 +114,9 @@ class GitHubClient:
         if not self.config.repo:
             missing.append("GITHUB_REPO")
 
+        if not self.config.base_branch:
+            missing.append("GITHUB_BASE_BRANCH")
+
         if missing:
             raise ValueError(
                 "Missing GitHub configuration: "
@@ -115,15 +129,6 @@ class GitHubClient:
     ) -> str:
         """
         Execute a Git command inside the target repository.
-
-        Args:
-            *args: Git command arguments.
-
-        Returns:
-            Standard output from Git.
-
-        Raises:
-            RuntimeError: If Git exits with a non-zero status.
         """
 
         command = [
@@ -192,12 +197,6 @@ class GitHubClient:
     ) -> str:
         """
         Create and switch to a new branch.
-
-        Args:
-            branch_name: Name of the new branch.
-
-        Returns:
-            Created branch name.
         """
 
         branch_name = branch_name.strip()
@@ -228,7 +227,7 @@ class GitHubClient:
         Stage repository changes.
 
         If files are supplied, only those files are staged.
-        Otherwise all tracked/untracked changes are staged.
+        Otherwise all changes are staged.
         """
 
         if files:
@@ -248,10 +247,7 @@ class GitHubClient:
         message: str,
     ) -> str:
         """
-        Commit staged changes.
-
-        Returns:
-            Commit SHA.
+        Commit staged changes and return the commit SHA.
         """
 
         message = message.strip()
@@ -279,9 +275,9 @@ class GitHubClient:
         """
         Push the current branch to origin.
 
-        The repository's existing Git credential configuration
-        is used for authentication. The GitHub token is not
-        inserted into the remote URL.
+        Existing Git credential configuration is used for
+        authentication. The GitHub token is never inserted
+        into the Git remote URL.
         """
 
         if branch_name is None:
@@ -306,15 +302,254 @@ class GitHubClient:
         branch_name: str,
     ) -> str:
         """
-        Create a new branch and return its name.
+        Create a new Git branch.
         """
 
         return self.create_branch(
             branch_name
         )
 
+    def _github_request(
+        self,
+        method: str,
+        endpoint: str,
+        payload: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """
+        Send an authenticated request to the GitHub REST API.
+
+        The GitHub token is never included in logs or returned
+        in exceptions.
+        """
+
+        self.validate_config()
+
+        endpoint = endpoint.lstrip("/")
+
+        url = (
+            f"{GITHUB_API_URL}/{endpoint}"
+        )
+
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "Authorization": (
+                f"Bearer {self.config.token}"
+            ),
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "AI-Software-Engineer",
+        }
+
+        body = None
+
+        if payload is not None:
+            body = json.dumps(
+                payload
+            ).encode("utf-8")
+
+            headers["Content-Type"] = (
+                "application/json"
+            )
+
+        request = Request(
+            url,
+            data=body,
+            headers=headers,
+            method=method.upper(),
+        )
+
+        try:
+            with urlopen(
+                request,
+                timeout=30,
+            ) as response:
+                response_body = response.read()
+
+                if not response_body:
+                    return {}
+
+                return json.loads(
+                    response_body.decode("utf-8")
+                )
+
+        except HTTPError as exc:
+            response_body = ""
+
+            try:
+                response_body = (
+                    exc.read()
+                    .decode("utf-8", errors="replace")
+                )
+            except Exception:
+                pass
+
+            raise RuntimeError(
+                "GitHub API request failed: "
+                f"HTTP {exc.code}. "
+                f"{response_body[:1000]}"
+            ) from exc
+
+        except URLError as exc:
+            raise RuntimeError(
+                "Unable to connect to GitHub API."
+            ) from exc
+
+    def create_pull_request(
+        self,
+        branch_name: str,
+        title: str,
+        body: str = "",
+        base_branch: Optional[str] = None,
+    ) -> PullRequestResult:
+        """
+        Create a Pull Request on GitHub.
+
+        Args:
+            branch_name:
+                Source branch containing the changes.
+
+            title:
+                Pull Request title.
+
+            body:
+                Pull Request description.
+
+            base_branch:
+                Target branch. Defaults to configured base branch.
+
+        Returns:
+            PullRequestResult containing PR number and URL.
+        """
+
+        branch_name = branch_name.strip()
+        title = title.strip()
+        body = body.strip()
+
+        if not branch_name:
+            raise ValueError(
+                "Branch name cannot be empty."
+            )
+
+        if not title:
+            raise ValueError(
+                "Pull Request title cannot be empty."
+            )
+
+        if base_branch is None:
+            base_branch = (
+                self.config.base_branch
+            )
+
+        base_branch = base_branch.strip()
+
+        if not base_branch:
+            raise ValueError(
+                "Base branch cannot be empty."
+            )
+
+        payload = {
+            "title": title,
+            "head": branch_name,
+            "base": base_branch,
+            "body": body,
+        }
+
+        result = self._github_request(
+            "POST",
+            (
+                f"/repos/"
+                f"{self.config.owner}/"
+                f"{self.config.repo}/"
+                "pulls"
+            ),
+            payload,
+        )
+
+        number = result.get(
+            "number"
+        )
+
+        url = result.get(
+            "html_url"
+        )
+
+        if not isinstance(
+            number,
+            int,
+        ):
+            raise RuntimeError(
+                "GitHub did not return a valid "
+                "Pull Request number."
+            )
+
+        if not isinstance(
+            url,
+            str,
+        ) or not url:
+            raise RuntimeError(
+                "GitHub did not return a valid "
+                "Pull Request URL."
+            )
+
+        return PullRequestResult(
+            number=number,
+            url=url,
+            title=title,
+            branch=branch_name,
+            base_branch=base_branch,
+        )
+
+    def create_pull_request_from_changes(
+        self,
+        branch_name: str,
+        commit_message: str,
+        pr_title: str,
+        pr_body: str = "",
+        files: Optional[list[str]] = None,
+    ) -> PullRequestResult:
+        """
+        Complete the GitHub operation:
+
+        1. Create branch
+        2. Stage changes
+        3. Commit changes
+        4. Push branch
+        5. Create Pull Request
+        """
+
+        self.validate_config()
+
+        self.create_branch(
+            branch_name
+        )
+
+        self.stage_changes(
+            files
+        )
+
+        status = self.get_status()
+
+        if not status:
+            raise RuntimeError(
+                "No changes are available to commit."
+            )
+
+        self.commit_changes(
+            commit_message
+        )
+
+        self.push_branch(
+            branch_name
+        )
+
+        return self.create_pull_request(
+            branch_name=branch_name,
+            title=pr_title,
+            body=pr_body,
+        )
+
 
 __all__ = [
     "GitHubConfig",
     "GitHubClient",
+    "PullRequestResult",
 ]
