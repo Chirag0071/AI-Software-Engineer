@@ -1,71 +1,104 @@
-"""
-LangGraph workflow for the Autonomous AI Software Engineer.
+from __future__ import annotations
 
-Workflow:
+from datetime import datetime, timezone
+from typing import Callable
 
-Repository Analyst
-        ↓
-Repository Intelligence
-        ↓
-Planner
-        ↓
-Coder
-        ↓
-Test Agent
-        ↓
-   ┌────┴────┐
- PASS       FAIL
-   ↓          ↓
-Code Review  Debugger
-   ↓          ↓
-Human       Prepare Retry
-Approval       ↓
-   ↓          Coder
-  END
-"""
+from langgraph.graph import END, START, StateGraph
 
-from langgraph.graph import (
-    END,
-    START,
-    StateGraph,
-)
-
-from backend.agents.code_review import (
-    code_review_agent,
-)
-from backend.agents.coder import (
-    coder_agent,
-)
-from backend.agents.debugger import (
-    debugger_agent,
-)
-from backend.agents.human_approval import (
-    human_approval_agent,
-)
-from backend.agents.planner import (
-    planner_agent,
-)
-from backend.agents.repository import (
-    repository_analyst,
-)
-from backend.agents.repository_intelligence import (
-    repository_intelligence,
-)
-from backend.agents.test_agent import (
-    run_test_agent,
-)
+from backend.agents.code_review import code_review_agent
+from backend.agents.coder import coder_agent
+from backend.agents.debugger import debugger_agent
+from backend.agents.human_approval import human_approval_agent
+from backend.agents.planner import planner_agent
+from backend.agents.repository import repository_analyst
+from backend.agents.repository_intelligence import repository_intelligence
+from backend.agents.test_agent import run_test_agent
 from backend.graph.state import AgentState
 
 
-MAX_DEBUG_RETRIES = 3
+DEFAULT_MAX_DEBUG_RETRIES = 3
 
 
-def route_after_repository_analysis(
+def add_event(
+    state: AgentState,
+    agent: str,
+    event_type: str,
+    message: str,
+) -> AgentState:
+
+    events = list(
+        state.get("events", [])
+    )
+
+    events.append(
+        {
+            "timestamp": datetime.now(
+                timezone.utc
+            ).isoformat(),
+            "agent": agent,
+            "event_type": event_type,
+            "message": message,
+            "metadata": {},
+        }
+    )
+
+    return {
+        **state,
+        "events": events,
+    }
+
+
+def wrap_agent(
+    name: str,
+    function: Callable[
+        [AgentState],
+        AgentState,
+    ],
+):
+    def wrapped(
+        state: AgentState,
+    ) -> AgentState:
+
+        state = add_event(
+            state,
+            name,
+            "started",
+            f"{name} started",
+        )
+
+        try:
+            result = function(state)
+
+            return add_event(
+                result,
+                name,
+                "completed",
+                f"{name} completed",
+            )
+
+        except Exception as exc:
+            state = add_event(
+                state,
+                name,
+                "failed",
+                str(exc),
+            )
+
+            return {
+                **state,
+                "current_step": f"{name}_failed",
+                "errors": [
+                    *state.get("errors", []),
+                    f"{name}: {exc}",
+                ],
+            }
+
+    return wrapped
+
+
+def route_repository_analysis(
     state: AgentState,
 ) -> str:
-    """
-    Route repository analysis.
-    """
 
     if (
         state.get("current_step")
@@ -76,12 +109,9 @@ def route_after_repository_analysis(
     return "end"
 
 
-def route_after_repository_intelligence(
+def route_repository_intelligence(
     state: AgentState,
 ) -> str:
-    """
-    Route repository intelligence.
-    """
 
     if (
         state.get("current_step")
@@ -92,34 +122,23 @@ def route_after_repository_intelligence(
     return "end"
 
 
-def route_after_planner(
+def route_planner(
     state: AgentState,
 ) -> str:
-    """
-    Route planning to Coder.
-    """
-
-    plan = state.get(
-        "plan",
-        [],
-    )
 
     if (
         state.get("current_step")
         == "planning_complete"
-        and plan
+        and state.get("plan")
     ):
         return "coder"
 
     return "end"
 
 
-def route_after_coder(
+def route_coder(
     state: AgentState,
 ) -> str:
-    """
-    Route Coder output to Test Agent.
-    """
 
     if (
         state.get("current_step")
@@ -130,59 +149,52 @@ def route_after_coder(
     return "end"
 
 
-def route_after_testing(
+def route_testing(
     state: AgentState,
 ) -> str:
-    """
-    Decide whether to review, debug, or stop.
-    """
 
-    test_results = state.get(
+    if state.get(
         "test_results",
         {},
-    )
-
-    if test_results.get(
+    ).get(
         "success",
         False,
     ):
         return "code_review"
 
-    retry_count = state.get(
+    retries = state.get(
         "debug_retry_count",
         0,
     )
 
-    if retry_count >= MAX_DEBUG_RETRIES:
+    max_retries = state.get(
+        "max_debug_retries",
+        DEFAULT_MAX_DEBUG_RETRIES,
+    )
+
+    if retries >= max_retries:
         return "end"
 
     return "debugger"
 
 
-def route_after_debugger(
+def route_debugger(
     state: AgentState,
 ) -> str:
-    """
-    Route debugger output back to Coder
-    when a repair is required.
-    """
+
+    debugger_result = state.get(
+        "debugger_result",
+        {},
+    )
 
     if (
         state.get("current_step")
         == "debugging_complete"
+        and debugger_result.get(
+            "files_to_fix"
+        )
     ):
-        debugger_result = state.get(
-            "debugger_result",
-            {},
-        )
-
-        files_to_fix = debugger_result.get(
-            "files_to_fix",
-            [],
-        )
-
-        if files_to_fix:
-            return "prepare_debug_retry"
+        return "prepare_debug_retry"
 
     return "end"
 
@@ -190,41 +202,36 @@ def route_after_debugger(
 def prepare_debug_retry(
     state: AgentState,
 ) -> AgentState:
-    """
-    Prepare state for another Coder → Test cycle.
-    """
-
-    retry_count = state.get(
-        "debug_retry_count",
-        0,
-    )
 
     return {
         **state,
-        "debug_retry_count": retry_count + 1,
+        "debug_retry_count": (
+            state.get(
+                "debug_retry_count",
+                0,
+            )
+            + 1
+        ),
+        "iteration_count": (
+            state.get(
+                "iteration_count",
+                0,
+            )
+            + 1
+        ),
         "current_step": "debug_retry",
     }
 
 
-def route_after_code_review(
+def route_code_review(
     state: AgentState,
 ) -> str:
-    """
-    Route approved code to the human approval gate.
-
-    Code that requires changes does not proceed to
-    human approval.
-    """
-
-    review_results = state.get(
-        "review_results",
-        {},
-    )
 
     if (
-        review_results.get(
-            "overall_status"
-        )
+        state.get(
+            "review_results",
+            {},
+        ).get("overall_status")
         == "approved"
     ):
         return "human_approval"
@@ -233,46 +240,57 @@ def route_after_code_review(
 
 
 def build_workflow():
-    """
-    Build and compile the complete LangGraph workflow.
-    """
 
     workflow = StateGraph(
         AgentState
     )
 
-    # -------------------------------------------------
-    # Nodes
-    # -------------------------------------------------
-
     workflow.add_node(
         "repository_analyst",
-        repository_analyst,
+        wrap_agent(
+            "repository_analyst",
+            repository_analyst,
+        ),
     )
 
     workflow.add_node(
         "repository_intelligence",
-        repository_intelligence,
+        wrap_agent(
+            "repository_intelligence",
+            repository_intelligence,
+        ),
     )
 
     workflow.add_node(
         "planner",
-        planner_agent,
+        wrap_agent(
+            "planner",
+            planner_agent,
+        ),
     )
 
     workflow.add_node(
         "coder",
-        coder_agent,
+        wrap_agent(
+            "coder",
+            coder_agent,
+        ),
     )
 
     workflow.add_node(
         "test_agent",
-        run_test_agent,
+        wrap_agent(
+            "test_agent",
+            run_test_agent,
+        ),
     )
 
     workflow.add_node(
         "debugger",
-        debugger_agent,
+        wrap_agent(
+            "debugger",
+            debugger_agent,
+        ),
     )
 
     workflow.add_node(
@@ -282,30 +300,28 @@ def build_workflow():
 
     workflow.add_node(
         "code_review",
-        code_review_agent,
+        wrap_agent(
+            "code_review",
+            code_review_agent,
+        ),
     )
 
     workflow.add_node(
         "human_approval",
-        human_approval_agent,
+        wrap_agent(
+            "human_approval",
+            human_approval_agent,
+        ),
     )
-
-    # -------------------------------------------------
-    # Entry
-    # -------------------------------------------------
 
     workflow.add_edge(
         START,
         "repository_analyst",
     )
 
-    # -------------------------------------------------
-    # Repository Analyst
-    # -------------------------------------------------
-
     workflow.add_conditional_edges(
         "repository_analyst",
-        route_after_repository_analysis,
+        route_repository_analysis,
         {
             "repository_intelligence":
                 "repository_intelligence",
@@ -313,52 +329,36 @@ def build_workflow():
         },
     )
 
-    # -------------------------------------------------
-    # Repository Intelligence
-    # -------------------------------------------------
-
     workflow.add_conditional_edges(
         "repository_intelligence",
-        route_after_repository_intelligence,
+        route_repository_intelligence,
         {
             "planner": "planner",
             "end": END,
         },
     )
 
-    # -------------------------------------------------
-    # Planner
-    # -------------------------------------------------
-
     workflow.add_conditional_edges(
         "planner",
-        route_after_planner,
+        route_planner,
         {
             "coder": "coder",
             "end": END,
         },
     )
 
-    # -------------------------------------------------
-    # Coder
-    # -------------------------------------------------
-
     workflow.add_conditional_edges(
         "coder",
-        route_after_coder,
+        route_coder,
         {
             "test_agent": "test_agent",
             "end": END,
         },
     )
 
-    # -------------------------------------------------
-    # Testing
-    # -------------------------------------------------
-
     workflow.add_conditional_edges(
         "test_agent",
-        route_after_testing,
+        route_testing,
         {
             "code_review": "code_review",
             "debugger": "debugger",
@@ -366,13 +366,9 @@ def build_workflow():
         },
     )
 
-    # -------------------------------------------------
-    # Debugger
-    # -------------------------------------------------
-
     workflow.add_conditional_edges(
         "debugger",
-        route_after_debugger,
+        route_debugger,
         {
             "prepare_debug_retry":
                 "prepare_debug_retry",
@@ -380,31 +376,20 @@ def build_workflow():
         },
     )
 
-    # -------------------------------------------------
-    # Debug retry
-    # -------------------------------------------------
-
     workflow.add_edge(
         "prepare_debug_retry",
         "coder",
     )
 
-    # -------------------------------------------------
-    # Code Review
-    # -------------------------------------------------
-
     workflow.add_conditional_edges(
         "code_review",
-        route_after_code_review,
+        route_code_review,
         {
-            "human_approval": "human_approval",
+            "human_approval":
+                "human_approval",
             "end": END,
         },
     )
-
-    # -------------------------------------------------
-    # Human Approval
-    # -------------------------------------------------
 
     workflow.add_edge(
         "human_approval",

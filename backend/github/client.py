@@ -42,7 +42,8 @@ class GitHubConfig:
 @dataclass
 class PullRequestResult:
     """
-    Information returned after creating a GitHub Pull Request.
+    Information returned after creating or finding
+    a GitHub Pull Request.
     """
 
     number: int
@@ -146,6 +147,7 @@ class GitHubClient:
                 errors="replace",
                 check=False,
             )
+
         except FileNotFoundError as exc:
             raise RuntimeError(
                 "Git executable was not found. "
@@ -314,7 +316,7 @@ class GitHubClient:
         method: str,
         endpoint: str,
         payload: Optional[dict[str, Any]] = None,
-    ) -> dict[str, Any]:
+    ) -> Any:
         """
         Send an authenticated request to the GitHub REST API.
 
@@ -362,6 +364,7 @@ class GitHubClient:
                 request,
                 timeout=30,
             ) as response:
+
                 response_body = response.read()
 
                 if not response_body:
@@ -377,7 +380,10 @@ class GitHubClient:
             try:
                 response_body = (
                     exc.read()
-                    .decode("utf-8", errors="replace")
+                    .decode(
+                        "utf-8",
+                        errors="replace",
+                    )
                 )
             except Exception:
                 pass
@@ -393,6 +399,138 @@ class GitHubClient:
                 "Unable to connect to GitHub API."
             ) from exc
 
+    def find_open_pull_request(
+        self,
+        branch_name: str,
+        base_branch: Optional[str] = None,
+    ) -> Optional[PullRequestResult]:
+        """
+        Find an existing open Pull Request for a branch.
+
+        Returns None when no matching open Pull Request exists.
+        """
+
+        branch_name = branch_name.strip()
+
+        if not branch_name:
+            raise ValueError(
+                "Branch name cannot be empty."
+            )
+
+        if base_branch is None:
+            base_branch = self.config.base_branch
+
+        base_branch = base_branch.strip()
+
+        if not base_branch:
+            raise ValueError(
+                "Base branch cannot be empty."
+            )
+
+        result = self._github_request(
+            "GET",
+            (
+                f"/repos/"
+                f"{self.config.owner}/"
+                f"{self.config.repo}/"
+                "pulls"
+                "?state=open"
+            ),
+        )
+
+        if not isinstance(
+            result,
+            list,
+        ):
+            raise RuntimeError(
+                "GitHub did not return a valid "
+                "Pull Request list."
+            )
+
+        for item in result:
+            if not isinstance(
+                item,
+                dict,
+            ):
+                continue
+
+            head = item.get(
+                "head",
+                {},
+            )
+
+            base = item.get(
+                "base",
+                {},
+            )
+
+            if not isinstance(
+                head,
+                dict,
+            ):
+                continue
+
+            if not isinstance(
+                base,
+                dict,
+            ):
+                continue
+
+            head_ref = head.get(
+                "ref"
+            )
+
+            base_ref = base.get(
+                "ref"
+            )
+
+            if (
+                head_ref != branch_name
+                or base_ref != base_branch
+            ):
+                continue
+
+            number = item.get(
+                "number"
+            )
+
+            url = item.get(
+                "html_url"
+            )
+
+            title = item.get(
+                "title",
+                "Existing Pull Request",
+            )
+
+            if not isinstance(
+                number,
+                int,
+            ):
+                continue
+
+            if not isinstance(
+                url,
+                str,
+            ) or not url:
+                continue
+
+            if not isinstance(
+                title,
+                str,
+            ):
+                title = "Existing Pull Request"
+
+            return PullRequestResult(
+                number=number,
+                url=url,
+                title=title,
+                branch=branch_name,
+                base_branch=base_branch,
+            )
+
+        return None
+
     def create_pull_request(
         self,
         branch_name: str,
@@ -402,6 +540,9 @@ class GitHubClient:
     ) -> PullRequestResult:
         """
         Create a Pull Request on GitHub.
+
+        Duplicate detection is handled by PullRequestService.
+        This method performs only the actual PR creation request.
 
         Args:
             branch_name:

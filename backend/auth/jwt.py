@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime, timedelta
-from typing import Any, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from dotenv import load_dotenv
 from jose import jwt
@@ -12,15 +12,14 @@ from passlib.context import CryptContext
 
 load_dotenv()
 
-
-SECRET_KEY: str = os.getenv(
+SECRET_KEY = os.getenv(
     "SECRET_KEY",
     "dev-secret-key",
 )
 
-ALGORITHM: str = "HS256"
+ALGORITHM = "HS256"
 
-ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
+ACCESS_TOKEN_EXPIRE_MINUTES = 15
 
 pwd_context = CryptContext(
     schemes=["bcrypt"],
@@ -31,13 +30,17 @@ pwd_context = CryptContext(
 def hash_password(
     password: str,
 ) -> str:
-    return pwd_context.hash(password)
+
+    return pwd_context.hash(
+        password
+    )
 
 
 def verify_password(
     plain_password: str,
     hashed_password: str,
 ) -> bool:
+
     return pwd_context.verify(
         plain_password,
         hashed_password,
@@ -46,25 +49,26 @@ def verify_password(
 
 def create_access_token(
     data: dict[str, Any],
-    expires_delta: Optional[timedelta] = None,
+    expires_delta: timedelta | None = None,
 ) -> str:
-    to_encode = data.copy()
 
-    if "exp" not in to_encode:
-        if expires_delta is None:
-            expires_delta = timedelta(
+    payload = data.copy()
+
+    if "exp" not in payload:
+        expires_delta = (
+            expires_delta
+            or timedelta(
                 minutes=ACCESS_TOKEN_EXPIRE_MINUTES
             )
+        )
 
-        expire = (
-            datetime.utcnow()
+        payload["exp"] = (
+            datetime.now(timezone.utc)
             + expires_delta
         )
 
-        to_encode["exp"] = expire
-
     return jwt.encode(
-        to_encode,
+        payload,
         SECRET_KEY,
         algorithm=ALGORITHM,
     )
@@ -73,27 +77,30 @@ def create_access_token(
 def verify_token(
     token: str,
 ) -> dict[str, Any]:
-    payload = jwt.decode(
+
+    return jwt.decode(
         token,
         SECRET_KEY,
         algorithms=[ALGORITHM],
     )
 
-    return payload
-
 
 def get_role_from_token(
     token: str,
-) -> Optional[str]:
+) -> str | None:
+
     try:
-        payload = verify_token(token)
+        payload = verify_token(
+            token
+        )
 
         role = payload.get("role")
 
-        if role is None:
-            return None
-
-        return str(role)
+        return (
+            str(role)
+            if role is not None
+            else None
+        )
 
     except JWTError:
         return None

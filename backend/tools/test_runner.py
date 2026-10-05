@@ -1,130 +1,213 @@
+from __future__ import annotations
+
 import os
+import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
-TEST_TIMEOUT_SECONDS = 120
+TEST_TIMEOUT_SECONDS = int(
+    os.getenv(
+        "TEST_TIMEOUT_SECONDS",
+        "120",
+    )
+)
+
+DOCKER_IMAGE = os.getenv(
+    "SANDBOX_DOCKER_IMAGE",
+    "ai-software-engineer-sandbox:latest",
+)
+
+
+def build_result(
+    success: bool,
+    return_code: int,
+    stdout: str = "",
+    stderr: str = "",
+    command: list[str] | None = None,
+    duration: float = 0.0,
+    sandbox: str = "local",
+) -> dict:
+
+    return {
+        "success": success,
+        "return_code": return_code,
+        "stdout": stdout,
+        "stderr": stderr,
+        "command": command or [],
+        "duration_seconds": round(
+            duration,
+            3,
+        ),
+        "sandbox": sandbox,
+    }
 
 
 def run_tests(
     repository_path: str,
+    sandbox: str | None = None,
 ) -> dict:
-    """
-    Run the repository test suite safely.
-
-    Tests are executed using the same Python interpreter
-    that is running the AI Software Engineer backend.
-    """
 
     root = Path(
         repository_path
     ).resolve()
 
-    if not root.exists():
-
-        return {
-            "success": False,
-            "return_code": -1,
-            "stdout": "",
-            "stderr": (
-                f"Repository does not exist: "
+    if not root.exists() or not root.is_dir():
+        return build_result(
+            False,
+            -1,
+            stderr=(
+                f"Invalid repository path: "
                 f"{repository_path}"
             ),
-        }
+        )
 
-    if not root.is_dir():
+    mode = (
+        sandbox
+        or os.getenv(
+            "EXECUTION_MODE",
+            "local",
+        )
+    ).lower()
 
-        return {
-            "success": False,
-            "return_code": -1,
-            "stdout": "",
-            "stderr": (
-                f"Repository path is not a directory: "
-                f"{repository_path}"
-            ),
-        }
+    if (
+        mode == "docker"
+        and shutil.which("docker")
+    ):
+        return run_docker(root)
+
+    return run_local(root)
+
+
+def run_local(
+    root: Path,
+) -> dict:
 
     environment = os.environ.copy()
 
-    # Prevent Python from loading stale .pyc files.
     environment[
         "PYTHONDONTWRITEBYTECODE"
     ] = "1"
 
-    # Make the repository itself importable.
     environment[
         "PYTHONPATH"
     ] = str(root)
 
-    try:
+    command = [
+        sys.executable,
+        "-m",
+        "pytest",
+        "-q",
+    ]
 
+    started = time.perf_counter()
+
+    try:
         result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "pytest",
-                "-q",
-            ],
+            command,
             cwd=root,
             env=environment,
             capture_output=True,
             text=True,
             timeout=TEST_TIMEOUT_SECONDS,
+            check=False,
         )
 
-        return {
-            "success": result.returncode == 0,
-            "return_code": result.returncode,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-        }
-
-    except subprocess.TimeoutExpired as exc:
-
-        stdout = ""
-
-        stderr = (
-            "Test execution timed out after "
-            f"{TEST_TIMEOUT_SECONDS} seconds."
+        return build_result(
+            result.returncode == 0,
+            result.returncode,
+            result.stdout,
+            result.stderr,
+            command,
+            time.perf_counter() - started,
+            "local",
         )
 
-        if exc.stdout:
-
-            stdout = str(
-                exc.stdout
-            )
-
-        if exc.stderr:
-
-            stderr += (
-                "\n\nPartial stderr:\n"
-                + str(exc.stderr)
-            )
-
-        return {
-            "success": False,
-            "return_code": -1,
-            "stdout": stdout,
-            "stderr": stderr,
-        }
-
-    except KeyboardInterrupt:
-
-        return {
-            "success": False,
-            "return_code": -2,
-            "stdout": "",
-            "stderr": (
-                "Test execution was interrupted."
+    except subprocess.TimeoutExpired:
+        return build_result(
+            False,
+            -1,
+            stderr=(
+                "Test execution timed out after "
+                f"{TEST_TIMEOUT_SECONDS} seconds."
             ),
-        }
+            command=command,
+            duration=(
+                time.perf_counter()
+                - started
+            ),
+            sandbox="local",
+        )
 
-    except Exception as exc:
 
-        return {
-            "success": False,
-            "return_code": -1,
-            "stdout": "",
-            "stderr": str(exc),
-        }
+def run_docker(
+    root: Path,
+) -> dict:
+
+    command = [
+        "docker",
+        "run",
+        "--rm",
+        "--network",
+        "none",
+        "--cpus",
+        os.getenv(
+            "SANDBOX_CPUS",
+            "1",
+        ),
+        "--memory",
+        os.getenv(
+            "SANDBOX_MEMORY",
+            "512m",
+        ),
+        "--pids-limit",
+        os.getenv(
+            "SANDBOX_PIDS",
+            "128",
+        ),
+        "-v",
+        f"{root}:/workspace:rw",
+        "-w",
+        "/workspace",
+        DOCKER_IMAGE,
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+    ]
+
+    started = time.perf_counter()
+
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=TEST_TIMEOUT_SECONDS + 30,
+            check=False,
+        )
+
+        return build_result(
+            result.returncode == 0,
+            result.returncode,
+            result.stdout,
+            result.stderr,
+            command,
+            time.perf_counter() - started,
+            "docker",
+        )
+
+    except subprocess.TimeoutExpired:
+        return build_result(
+            False,
+            -1,
+            stderr="Docker test execution timed out.",
+            command=command,
+            duration=(
+                time.perf_counter()
+                - started
+            ),
+            sandbox="docker",
+        )

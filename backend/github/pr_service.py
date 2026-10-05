@@ -230,6 +230,19 @@ class PullRequestService:
         comment: str = "",
         files: Optional[list[str]] = None,
     ) -> GitHubResult:
+        """
+        Create a GitHub Pull Request from an approved state.
+
+        The operation is:
+
+        1. Verify human approval.
+        2. Create branch.
+        3. Stage changes.
+        4. Commit changes.
+        5. Push branch.
+        6. Check for an existing open PR.
+        7. Create a new PR if one does not exist.
+        """
 
         approval = state.get(
             "approval_result",
@@ -290,15 +303,20 @@ class PullRequestService:
             comment,
         )
 
+        commit_sha = ""
+
         try:
+            # Create branch.
             self.github_client.create_branch(
                 branch_name
             )
 
+            # Stage generated/modified files.
             self.github_client.stage_changes(
                 files
             )
 
+            # Verify that changes exist.
             status = self.github_client.get_status()
 
             if not status:
@@ -314,16 +332,36 @@ class PullRequestService:
                     ),
                 }
 
+            # Commit changes.
             commit_sha = (
                 self.github_client.commit_changes(
                     commit_message
                 )
             )
 
+            # Push branch.
             self.github_client.push_branch(
                 branch_name
             )
 
+            # Check whether an open PR already exists.
+            existing_pr = (
+                self.github_client.find_open_pull_request(
+                    branch_name=branch_name,
+                )
+            )
+
+            if existing_pr is not None:
+                return {
+                    "status": "already_exists",
+                    "branch": existing_pr.branch,
+                    "commit_sha": commit_sha,
+                    "pr_number": existing_pr.number,
+                    "pr_url": existing_pr.url,
+                    "error": "",
+                }
+
+            # Create new PR.
             pr: PullRequestResult = (
                 self.github_client.create_pull_request(
                     branch_name=branch_name,
@@ -345,7 +383,7 @@ class PullRequestService:
             return {
                 "status": "failed",
                 "branch": branch_name,
-                "commit_sha": "",
+                "commit_sha": commit_sha,
                 "pr_number": 0,
                 "pr_url": "",
                 "error": str(exc),

@@ -4,105 +4,58 @@ from pathlib import Path
 
 from backend.graph.state import AgentState
 from backend.llm import get_groq_client, get_model
-from backend.tools.filesystem import (
-    read_file,
-    write_file,
-)
+from backend.tools.filesystem import read_file, write_file
 
 
 MAX_FILE_SIZE = 20_000
 MAX_TOTAL_CONTEXT = 30_000
 MAX_LLM_RETRIES = 3
+RATE_LIMIT_WAIT_SECONDS = 10
 
 
 CODER_SYSTEM_PROMPT = """
 You are the Coder Agent in an autonomous software engineering system.
 
-Your job is to implement the requested software changes in an existing
-repository.
+Implement ONLY the current task.
 
-You must return ONLY valid JSON.
-
-You must never return Markdown.
-You must never return explanations outside the JSON object.
-
-The JSON must have exactly this structure:
+Return ONLY valid JSON using this structure:
 
 {
     "files": [
         {
-            "path": "relative/path/to/file.py",
+            "path": "relative/path.py",
             "action": "create",
             "content": "complete file content"
         }
     ],
-    "summary": "short description of implemented changes"
+    "summary": "short implementation summary"
 }
-
-Allowed actions:
-
-1. "create"
-   Use only when the file does not already exist.
-
-2. "modify"
-   Use only when the file already exists.
 
 Rules:
 
-1. Use relative paths only.
-2. Never use absolute paths.
-3. Never use ".." in paths.
-4. Never modify or create ".env".
-5. Never modify or create ".git" files.
-6. Never modify or create files inside ".venv".
-7. Never modify or create "__pycache__" files.
-8. Preserve the existing project architecture unless the requirement
-   explicitly requires an architectural change.
-9. When modifying an existing file, return the COMPLETE updated file.
+1. Modify only files listed in files_to_modify.
+2. Create only files listed in files_to_create.
+3. Files in READ-ONLY CONTEXT may be read but must NEVER be returned.
+4. Never modify .env.
+5. Never modify .git, .venv, __pycache__, node_modules or .pytest_cache.
+6. Use relative paths only.
+7. Never use ".." in paths.
+8. Return complete file contents.
+9. Do not return Markdown.
 10. Do not return partial code.
-11. Do not use placeholders such as:
-       TODO
-       ...
-       <existing code>
-       <rest of code>
-12. Do not invent files unless they are required by the task.
-13. Follow the implementation plan.
-14. Follow the debugger instructions when operating in repair mode.
-15. Keep changes focused on the requested requirement.
-16. Do not expose secrets or API keys.
-17. Never create a file named ".env".
-18. Never delete files unless the task explicitly requires deletion.
-19. Do not rename files unless the task explicitly requires a rename.
-20. Preserve existing functionality that is unrelated to the requested change.
-
-IMPORTANT:
-
-If a debugger identifies an existing file as needing repair, that file
-must be returned with action "modify", not "create".
-
-The Coder must not create a duplicate file when the debugger is asking
-for an existing file to be repaired.
+11. Do not add unrelated changes.
+12. Preserve existing functionality.
+13. Do not expose secrets.
+14. If repairing an existing file, use action "modify".
+15. Follow the implementation plan exactly.
 """
 
 
 def normalize_path(path: str) -> str:
-    """
-    Normalize a repository-relative path.
-    """
-
     if not isinstance(path, str):
-        raise ValueError(
-            "File path must be a string."
-        )
+        raise ValueError("File path must be a string.")
 
-    path = path.strip()
-
-    if not path:
-        raise ValueError(
-            "File path cannot be empty."
-        )
-
-    path = path.replace("\\", "/")
+    path = path.strip().replace("\\", "/")
 
     while "//" in path:
         path = path.replace("//", "/")
@@ -110,28 +63,27 @@ def normalize_path(path: str) -> str:
     if path.startswith("./"):
         path = path[2:]
 
+    if not path:
+        raise ValueError("File path cannot be empty.")
+
     return path
 
 
 def is_safe_relative_path(path: str) -> bool:
-    """
-    Check whether a path is safe to access inside the repository.
-    """
-
     try:
-        normalized = normalize_path(path)
-    except Exception:
+        path = normalize_path(path)
+    except ValueError:
         return False
 
-    path_object = Path(normalized)
+    p = Path(path)
 
-    if path_object.is_absolute():
+    if p.is_absolute():
         return False
 
-    if ".." in path_object.parts:
+    if ".." in p.parts:
         return False
 
-    blocked_parts = {
+    blocked = {
         ".git",
         ".venv",
         "__pycache__",
@@ -139,314 +91,207 @@ def is_safe_relative_path(path: str) -> bool:
         ".pytest_cache",
     }
 
-    if any(
-        part in blocked_parts
-        for part in path_object.parts
-    ):
+    if any(part in blocked for part in p.parts):
         return False
 
-    if path_object.name == ".env":
+    if p.name == ".env":
         return False
 
     return True
 
 
-def path_exists(
-    repository_path: str,
-    relative_path: str,
-) -> bool:
-    """
-    Check whether a repository-relative file exists.
-    """
+def build_authorized_paths(task: dict) -> tuple[set[str], set[str]]:
+    modify = {
+        normalize_path(path)
+        for path in task.get("files_to_modify", [])
+    }
 
-    try:
-        normalized = normalize_path(
-            relative_path
-        )
+    create = {
+        normalize_path(path)
+        for path in task.get("files_to_create", [])
+    }
 
-        if not is_safe_relative_path(
-            normalized
-        ):
-            return False
+    for path in modify | create:
+        if not is_safe_relative_path(path):
+            raise ValueError(
+                f"Unsafe authorized file path: {path}"
+            )
 
-        root = Path(
-            repository_path
-        ).resolve()
-
-        file_path = (
-            root / normalized
-        ).resolve()
-
-        try:
-            file_path.relative_to(root)
-        except ValueError:
-            return False
-
-        return file_path.exists()
-
-    except Exception:
-        return False
+    return modify, create
 
 
 def build_file_context(
     repository_files: list[dict],
+    task: dict,
+    repository_path: str = "",
+    read_only_paths: set[str] | None = None,
 ) -> str:
     """
-    Build repository context for the Coder.
+    Give the Coder writable context only for authorized files.
+    Dependency files may be supplied as read-only context.
     """
 
-    if not repository_files:
-        return (
-            "No repository file contents were provided."
+    modify_paths, create_paths = build_authorized_paths(task)
+    read_only_paths = {
+        normalize_path(path)
+        for path in (read_only_paths or set())
+        if is_safe_relative_path(path)
+    }
+
+    writable_paths = modify_paths | create_paths
+
+    if not writable_paths:
+        raise ValueError(
+            "Current task does not authorize any files."
         )
 
-    sections = []
-    total_size = 0
+    snapshot = {}
 
     for file_data in repository_files:
-
-        if not isinstance(
-            file_data,
-            dict,
-        ):
+        if not isinstance(file_data, dict):
             continue
 
-        path = file_data.get(
-            "path",
-            ""
-        )
-
-        content = file_data.get(
-            "content",
-            ""
-        )
-
+        path = file_data.get("path", "")
         if not path:
             continue
 
-        path = normalize_path(
-            path
-        )
-
-        if not is_safe_relative_path(
-            path
-        ):
+        try:
+            path = normalize_path(path)
+        except ValueError:
             continue
 
-        content = str(
-            content
+        if not is_safe_relative_path(path):
+            continue
+
+        snapshot[path] = str(
+            file_data.get("content", "")
         )
+
+    sections = []
+    total = 0
+    context_paths = list(writable_paths) + [
+        path
+        for path in read_only_paths
+        if path not in writable_paths
+    ]
+
+    for path in context_paths:
+        if total >= MAX_TOTAL_CONTEXT:
+            break
+
+        is_read_only = (
+            path in read_only_paths
+            and path not in writable_paths
+        )
+
+        if path in create_paths and path not in snapshot:
+            content = "[NEW FILE - DOES NOT EXIST]"
+        elif repository_path:
+            try:
+                content = read_file(
+                    repository_path,
+                    path,
+                )
+            except FileNotFoundError:
+                content = "[FILE DOES NOT EXIST]"
+            except Exception as exc:
+                content = f"[FILE READ ERROR: {exc}]"
+        elif path in snapshot:
+            content = snapshot[path]
+        else:
+            content = "[FILE DOES NOT EXIST]"
 
         if len(content) > MAX_FILE_SIZE:
             content = (
                 content[:MAX_FILE_SIZE]
-                + "\n\n[FILE TRUNCATED]"
+                + "\n[FILE CONTEXT TRUNCATED]"
             )
 
-        remaining = (
-            MAX_TOTAL_CONTEXT
-            - total_size
-        )
-
-        if remaining <= 0:
-            break
-
+        remaining = MAX_TOTAL_CONTEXT - total
         if len(content) > remaining:
             content = (
                 content[:remaining]
-                + "\n\n[CONTEXT TRUNCATED]"
+                + "\n[CONTEXT TRUNCATED]"
             )
 
-        section = (
-            f"\n===== FILE: {path} =====\n"
-            f"{content}\n"
-            f"===== END FILE: {path} =====\n"
-        )
-
+        label = "READ-ONLY FILE" if is_read_only else "AUTHORIZED FILE"
         sections.append(
-            section
+            f"{label}: {path}\n"
+            f"{content}\n"
+            f"END FILE: {path}"
         )
+        total += len(content)
 
-        total_size += len(
-            content
-        )
-
-    if not sections:
-        return (
-            "No safe repository files were available."
-        )
-
-    return "\n".join(
-        sections
-    )
+    return "\n\n".join(sections)
 
 
-def build_plan_context(
+def build_read_only_dependency_paths(
     state: AgentState,
-) -> str:
-    """
-    Convert the implementation plan into
-    readable context for the Coder.
-    """
+    task: dict,
+) -> set[str]:
+    """Resolve earlier task files as read-only context."""
+    dependencies = {
+        str(item)
+        for item in task.get("dependencies", [])
+    }
 
-    plan = state.get(
-        "plan",
-        []
-    )
+    if not dependencies:
+        return set()
+
+    paths = set()
+
+    for previous_task in state.get("plan", []):
+        if str(previous_task.get("id")) not in dependencies:
+            continue
+
+        for path in (
+            previous_task.get("files_to_modify", [])
+            + previous_task.get("files_to_create", [])
+        ):
+            path = normalize_path(path)
+            if is_safe_relative_path(path):
+                paths.add(path)
+
+    return paths
+
+
+def build_plan_context(state: AgentState) -> str:
+    plan = state.get("plan", [])
 
     if not plan:
-        return (
-            "No implementation plan was provided."
-        )
+        return "No implementation plan."
 
     sections = []
 
     for task in plan:
-
-        if not isinstance(
-            task,
-            dict,
-        ):
-            continue
-
-        task_id = task.get(
-            "id",
-            ""
-        )
-
-        title = task.get(
-            "title",
-            ""
-        )
-
-        description = task.get(
-            "description",
-            ""
-        )
-
-        files_to_modify = task.get(
-            "files_to_modify",
-            []
-        )
-
-        files_to_create = task.get(
-            "files_to_create",
-            []
-        )
-
-        dependencies = task.get(
-            "dependencies",
-            []
-        )
-
-        tests_required = task.get(
-            "tests_required",
-            []
-        )
-
-        security_considerations = task.get(
-            "security_considerations",
-            []
-        )
-
         sections.append(
-            f"""
-TASK {task_id}
-Title:
-{title}
-
-Description:
-{description}
-
-Files to modify:
-{files_to_modify}
-
-Files to create:
-{files_to_create}
-
-Dependencies:
-{dependencies}
-
-Tests required:
-{tests_required}
-
-Security considerations:
-{security_considerations}
-"""
+            json.dumps(
+                {
+                    "id": task.get("id"),
+                    "title": task.get("title"),
+                    "description": task.get("description"),
+                    "files_to_modify": task.get(
+                        "files_to_modify",
+                        [],
+                    ),
+                    "files_to_create": task.get(
+                        "files_to_create",
+                        [],
+                    ),
+                    "dependencies": task.get(
+                        "dependencies",
+                        [],
+                    ),
+                    "tests_required": task.get(
+                        "tests_required",
+                        [],
+                    ),
+                },
+                indent=2,
+            )
         )
 
-    return "\n".join(
-        sections
-    )
-
-
-def build_repair_context(
-    state: AgentState,
-) -> str:
-    """
-    Build context specifically for a debugger repair cycle.
-    """
-
-    debugger_result = state.get(
-        "debugger_result",
-        {}
-    )
-
-    if not debugger_result:
-        return (
-            "No debugger result was provided."
-        )
-
-    diagnosis = debugger_result.get(
-        "diagnosis",
-        ""
-    )
-
-    errors = debugger_result.get(
-        "errors",
-        []
-    )
-
-    files_to_fix = debugger_result.get(
-        "files_to_fix",
-        []
-    )
-
-    fix_instructions = debugger_result.get(
-        "fix_instructions",
-        []
-    )
-
-    severity = debugger_result.get(
-        "severity",
-        ""
-    )
-
-    return f"""
-DEBUGGER DIAGNOSIS:
-{diagnosis}
-
-DEBUGGER ERRORS:
-{errors}
-
-FILES TO FIX:
-{files_to_fix}
-
-FIX INSTRUCTIONS:
-{fix_instructions}
-
-SEVERITY:
-{severity}
-
-IMPORTANT REPAIR RULE:
-
-Every file listed by the debugger must be checked against the
-repository before choosing "create" or "modify".
-
-If the file already exists, the action MUST be "modify".
-
-Do not create a second copy of an existing file.
-"""
+    return "\n\n".join(sections)
 
 
 def build_coder_prompt(
@@ -454,485 +299,142 @@ def build_coder_prompt(
     task: dict,
     repair_mode: bool = False,
 ) -> str:
-    """
-    Build the complete prompt sent to the Coder LLM.
-    """
 
-    repository_files = state.get(
-        "repository_files",
-        []
+    read_only_paths = build_read_only_dependency_paths(
+        state,
+        task,
     )
 
-    repository_summary = state.get(
-        "repository_summary",
-        ""
+    context = build_file_context(
+        state.get("repository_files", []),
+        task,
+        state.get("repository_path", ""),
+        read_only_paths,
     )
 
-    architecture_summary = state.get(
-        "architecture_summary",
-        ""
-    )
-
-    user_request = state.get(
-        "user_request",
-        ""
-    )
-
-    file_context = build_file_context(
-        repository_files
-    )
-
-    plan_context = build_plan_context(
-        state
+    debugger = state.get(
+        "debugger_result",
+        {},
     )
 
     repair_context = ""
 
     if repair_mode:
-        repair_context = build_repair_context(
-            state
-        )
+        repair_context = f"""
+DEBUGGER ANALYSIS
 
-    task_description = task.get(
-        "description",
-        ""
-    )
+Diagnosis:
+{debugger.get("diagnosis", "")}
 
-    task_title = task.get(
-        "title",
-        ""
-    )
+Errors:
+{json.dumps(debugger.get("errors", []), indent=2)}
 
-    files_to_modify = task.get(
-        "files_to_modify",
-        []
-    )
+Files to fix:
+{json.dumps(debugger.get("files_to_fix", []), indent=2)}
 
-    files_to_create = task.get(
-        "files_to_create",
-        []
-    )
+Instructions:
+{json.dumps(debugger.get("fix_instructions", []), indent=2)}
+"""
 
     return f"""
-{CODER_SYSTEM_PROMPT}
-
-==================================================
-USER REQUIREMENT
-==================================================
-
-{user_request}
-
-==================================================
-REPOSITORY SUMMARY
-==================================================
-
-{repository_summary}
-
-==================================================
-REPOSITORY ARCHITECTURE
-==================================================
-
-{architecture_summary}
-
-==================================================
-IMPLEMENTATION PLAN
-==================================================
-
-{plan_context}
-
-==================================================
 CURRENT TASK
-==================================================
 
-Task title:
-{task_title}
+ID:
+{task.get("id")}
 
-Task description:
-{task_description}
+Title:
+{task.get("title", "")}
 
-Files expected to modify:
-{files_to_modify}
+Description:
+{task.get("description", "")}
 
-Files expected to create:
-{files_to_create}
+Files allowed to modify:
+{json.dumps(task.get("files_to_modify", []), indent=2)}
 
-==================================================
-REPOSITORY FILE CONTENT
-==================================================
+Files allowed to create:
+{json.dumps(task.get("files_to_create", []), indent=2)}
 
-{file_context}
+Read-only dependency files:
+{json.dumps(sorted(read_only_paths), indent=2)}
 
-==================================================
-REPAIR MODE
-==================================================
+USER REQUIREMENT
 
-{repair_mode}
+{state.get("user_request", "")}
+
+IMPLEMENTATION PLAN
+
+{build_plan_context(state)}
 
 {repair_context}
 
-==================================================
-CODING REQUIREMENTS
-==================================================
+AUTHORIZED FILE CONTENT
 
-Implement the current task.
+{context}
 
-Return complete file contents.
+IMPORTANT:
 
-For existing files:
-- return action "modify"
-- return the complete updated file
+The authorization lists above are the final authority.
 
-For genuinely new files:
-- return action "create"
+You may read READ-ONLY FILE content for understanding,
+but you MUST NOT return those files.
 
-Do not return partial files.
-
-Do not return Markdown.
-
-Return ONLY valid JSON.
+Return complete content only for files that the current
+task is authorized to modify or create.
 """
 
 
-def clean_response(
-    content,
-) -> str:
-    """
-    Clean an LLM response before JSON parsing.
-    """
-
-    if content is None:
-        return ""
-
-    if isinstance(
-        content,
-        list,
-    ):
-
-        parts = []
-
-        for item in content:
-
-            if isinstance(
-                item,
-                dict,
-            ):
-
-                text = item.get(
-                    "text",
-                    ""
-                )
-
-                if text:
-                    parts.append(
-                        str(text)
-                    )
-
-            else:
-
-                parts.append(
-                    str(item)
-                )
-
-        content = "".join(
-            parts
-        )
-
-    content = str(
-        content
-    ).strip()
-
-    if not content:
-        return ""
-
-    if content.startswith(
-        "```json"
-    ):
-
-        content = content[
-            len("```json"):
-        ]
-
-    elif content.startswith(
-        "```"
-    ):
-
-        content = content[
-            len("```"):
-        ]
-
-    if content.endswith(
-        "```"
-    ):
-
-        content = content[
-            :-3
-        ]
-
-    return content.strip()
-
-
-def validate_coder_response(
-    result: dict,
-    repository_path: str,
-    authorized_modify: set[str],
-    authorized_create: set[str],
-    repair_mode: bool,
-) -> None:
-    """
-    Validate the Coder LLM response before writing anything.
-    """
-
-    if not isinstance(
-        result,
-        dict,
-    ):
-        raise ValueError(
-            "Coder response must be a JSON object."
-        )
-
-    if "files" not in result:
-        raise ValueError(
-            "Coder response is missing 'files'."
-        )
-
-    if "summary" not in result:
-        raise ValueError(
-            "Coder response is missing 'summary'."
-        )
-
-    files = result.get(
-        "files"
-    )
-
-    if not isinstance(
-        files,
-        list,
-    ):
-        raise ValueError(
-            "Coder 'files' must be a list."
-        )
-
-    seen_paths = set()
-
-    for file_data in files:
-
-        if not isinstance(
-            file_data,
-            dict,
-        ):
-            raise ValueError(
-                "Each Coder file entry must be an object."
-            )
-
-        path = file_data.get(
-            "path"
-        )
-
-        action = file_data.get(
-            "action"
-        )
-
-        content = file_data.get(
-            "content"
-        )
-
-        if not isinstance(
-            path,
-            str,
-        ):
-            raise ValueError(
-                "Coder file path must be a string."
-            )
-
-        if not isinstance(
-            action,
-            str,
-        ):
-            raise ValueError(
-                f"Missing action for file: {path}"
-            )
-
-        if not isinstance(
-            content,
-            str,
-        ):
-            raise ValueError(
-                f"Missing content for file: {path}"
-            )
-
-        normalized = normalize_path(
-            path
-        )
-
-        if not is_safe_relative_path(
-            normalized
-        ):
-            raise ValueError(
-                f"Unsafe file path: {normalized}"
-            )
-
-        if normalized in seen_paths:
-            raise ValueError(
-                f"Duplicate file returned: {normalized}"
-            )
-
-        seen_paths.add(
-            normalized
-        )
-
-        if action not in {
-            "create",
-            "modify",
-        }:
-            raise ValueError(
-                (
-                    f"Invalid action '{action}' "
-                    f"for file: {normalized}"
-                )
-            )
-
-        exists = path_exists(
-            repository_path,
-            normalized
-        )
-
-        if action == "modify" and not exists:
-            raise ValueError(
-                (
-                    f"Coder attempted to modify a file "
-                    f"that does not exist: {normalized}"
-                )
-            )
-
-        if action == "create" and exists:
-            raise ValueError(
-                (
-                    f"Coder attempted to create an existing "
-                    f"file: {normalized}. Use 'modify'."
-                )
-            )
-
-        if repair_mode:
-
-            if action == "create":
-                raise ValueError(
-                    (
-                        "Repair mode does not allow arbitrary "
-                        f"file creation: {normalized}"
-                    )
-                )
-
-            if (
-                authorized_modify
-                and normalized not in authorized_modify
-            ):
-                raise ValueError(
-                    (
-                        "Repair Coder attempted to modify "
-                        f"an unauthorized file: {normalized}"
-                    )
-                )
-
-        else:
-
-            if action == "modify":
-
-                if (
-                    authorized_modify
-                    and normalized not in authorized_modify
-                ):
-                    raise ValueError(
-                        (
-                            "Coder attempted to modify "
-                            f"an unauthorized file: {normalized}"
-                        )
-                    )
-
-            if action == "create":
-
-                if (
-                    authorized_create
-                    and normalized not in authorized_create
-                ):
-                    raise ValueError(
-                        (
-                            "Coder attempted to create "
-                            f"an unauthorized file: {normalized}"
-                        )
-                    )
-
-        if normalized == ".env":
-            raise ValueError(
-                "Coder cannot modify .env."
-            )
-
-        if (
-            "GROQ_API_KEY="
-            in content
-            or "OPENAI_API_KEY="
-            in content
-        ):
-            raise ValueError(
-                (
-                    f"Possible API key detected in "
-                    f"generated file: {normalized}"
-                )
-            )
-
-
-def call_coder_llm(
-    prompt: str,
-) -> dict:
-    """
-    Call Groq using structured JSON output.
-    """
-
-    client = get_groq_client()
-    model = get_model()
-
-    schema = {
-        "type": "object",
-        "properties": {
-            "files": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string"
+def build_coder_schema() -> dict:
+    return {
+        "name": "coder_response",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "files": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                            },
+                            "action": {
+                                "type": "string",
+                                "enum": [
+                                    "create",
+                                    "modify",
+                                ],
+                            },
+                            "content": {
+                                "type": "string",
+                            },
                         },
-                        "action": {
-                            "type": "string",
-                            "enum": [
-                                "create",
-                                "modify",
-                            ],
-                        },
-                        "content": {
-                            "type": "string"
-                        },
+                        "required": [
+                            "path",
+                            "action",
+                            "content",
+                        ],
+                        "additionalProperties": False,
                     },
-                    "required": [
-                        "path",
-                        "action",
-                        "content",
-                    ],
-                    "additionalProperties": False,
+                },
+                "summary": {
+                    "type": "string",
                 },
             },
-            "summary": {
-                "type": "string"
-            },
+            "required": [
+                "files",
+                "summary",
+            ],
+            "additionalProperties": False,
         },
-        "required": [
-            "files",
-            "summary",
-        ],
-        "additionalProperties": False,
     }
 
+
+def call_coder_llm(prompt: str) -> dict:
+    client = get_groq_client()
+
     response = client.chat.completions.create(
-        model=model,
+        model=get_model(),
         messages=[
             {
                 "role": "system",
@@ -944,424 +446,340 @@ def call_coder_llm(
             },
         ],
         temperature=0,
+        reasoning_effort="low",
+        max_tokens=20_000,
         response_format={
             "type": "json_schema",
-            "json_schema": {
-                "name": "coder_output",
-                "schema": schema,
-                "strict": True,
-            },
+            "json_schema": build_coder_schema(),
         },
     )
 
     if not response.choices:
         raise ValueError(
-            "Coder LLM returned no choices."
+            "Coder received no LLM response."
         )
 
-    message = response.choices[0].message
-
-    content = getattr(
-        message,
-        "content",
-        None,
-    )
-
-    content = clean_response(
-        content
-    )
+    content = response.choices[0].message.content
 
     if not content:
         raise ValueError(
-            "Coder LLM returned an empty response."
+            "Coder received an empty LLM response."
         )
 
-    try:
-        return json.loads(
-            content
-        )
-    except json.JSONDecodeError as exc:
+    data = json.loads(content)
+
+    if not isinstance(data, dict):
         raise ValueError(
-            f"Coder returned invalid JSON: {exc}"
-        ) from exc
+            "Coder response must be a JSON object."
+        )
+
+    return data
+
+
+def validate_coder_response(
+    data: dict,
+    task: dict,
+) -> list[dict]:
+
+    if not isinstance(data, dict):
+        raise ValueError(
+            "Coder response must be an object."
+        )
+
+    files = data.get("files")
+
+    if not isinstance(files, list) or not files:
+        raise ValueError(
+            "Coder returned no files."
+        )
+
+    allowed_modify, allowed_create = (
+        build_authorized_paths(task)
+    )
+
+    allowed = allowed_modify | allowed_create
+
+    validated = []
+    seen = set()
+
+    for item in files:
+        if not isinstance(item, dict):
+            raise ValueError(
+                "Invalid coder file object."
+            )
+
+        path = normalize_path(
+            item.get("path", "")
+        )
+
+        action = item.get("action")
+        content = item.get("content")
+
+        if path in seen:
+            raise ValueError(
+                f"Duplicate file returned: {path}"
+            )
+
+        seen.add(path)
+
+        if path not in allowed:
+            raise ValueError(
+                f"Coder attempted to modify "
+                f"an unauthorized file: {path}"
+            )
+
+        if action == "modify" and path not in allowed_modify:
+            raise ValueError(
+                f"File is not authorized for modification: {path}"
+            )
+
+        if action == "create" and path not in allowed_create:
+            raise ValueError(
+                f"File is not authorized for creation: {path}"
+            )
+
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError(
+                f"Empty content returned for: {path}"
+            )
+
+        validated.append(
+            {
+                "path": path,
+                "action": action,
+                "content": content,
+            }
+        )
+
+    return validated
 
 
 def execute_task(
     state: AgentState,
     task: dict,
     repair_mode: bool = False,
-) -> AgentState:
-    """
-    Execute one coding task.
-    """
-
-    repository_path = state.get(
-        "repository_path"
-    )
-
-    if not repository_path:
-        return {
-            **state,
-            "errors": [
-                *state.get(
-                    "errors",
-                    [],
-                ),
-                "Coder: No repository path provided.",
-            ],
-            "current_step": "coding_failed",
-        }
-
-    debugger_result = state.get(
-        "debugger_result",
-        {}
-    )
-
-    authorized_modify = set()
-    authorized_create = set()
-
-    if repair_mode:
-
-        debugger_files = debugger_result.get(
-            "files_to_fix",
-            []
-        )
-
-        for path in debugger_files:
-
-            try:
-                normalized = normalize_path(
-                    path
-                )
-            except Exception:
-                continue
-
-            if not is_safe_relative_path(
-                normalized
-            ):
-                continue
-
-            if path_exists(
-                repository_path,
-                normalized
-            ):
-                authorized_modify.add(
-                    normalized
-                )
-
-    else:
-
-        for path in task.get(
-            "files_to_modify",
-            []
-        ):
-
-            try:
-                normalized = normalize_path(
-                    path
-                )
-            except Exception:
-                continue
-
-            if not is_safe_relative_path(
-                normalized
-            ):
-                continue
-
-            if path_exists(
-                repository_path,
-                normalized
-            ):
-                authorized_modify.add(
-                    normalized
-                )
-
-        for path in task.get(
-            "files_to_create",
-            []
-        ):
-
-            try:
-                normalized = normalize_path(
-                    path
-                )
-            except Exception:
-                continue
-
-            if not is_safe_relative_path(
-                normalized
-            ):
-                continue
-
-            if not path_exists(
-                repository_path,
-                normalized
-            ):
-                authorized_create.add(
-                    normalized
-                )
-
+):
     prompt = build_coder_prompt(
         state,
         task,
-        repair_mode=repair_mode,
+        repair_mode,
     )
 
     last_error = None
 
     for attempt in range(
-        MAX_LLM_RETRIES
+        1,
+        MAX_LLM_RETRIES + 1,
     ):
-
         try:
-
-            result = call_coder_llm(
+            response = call_coder_llm(
                 prompt
             )
 
-            validate_coder_response(
-                result=result,
-                repository_path=repository_path,
-                authorized_modify=authorized_modify,
-                authorized_create=authorized_create,
-                repair_mode=repair_mode,
+            files = validate_coder_response(
+                response,
+                task,
             )
 
-            generated_files = list(
-                state.get(
-                    "generated_files",
-                    []
-                )
+            repository_path = state.get(
+                "repository_path"
             )
 
-            modified_files = list(
-                state.get(
-                    "modified_files",
-                    []
-                )
-            )
-
-            for file_data in result.get(
-                "files",
-                []
-            ):
-
-                relative_path = normalize_path(
-                    file_data["path"]
+            if not repository_path:
+                raise ValueError(
+                    "Repository path is missing."
                 )
 
-                action = file_data["action"]
-                content = file_data["content"]
+            for file_data in files:
+                path = file_data["path"]
 
-                if action == "modify":
-
-                    write_file(
+                if file_data["action"] == "modify":
+                    if not Path(
                         repository_path,
-                        relative_path,
-                        content,
-                    )
-
-                    if (
-                        relative_path
-                        not in modified_files
-                    ):
-                        modified_files.append(
-                            relative_path
+                        path,
+                    ).exists():
+                        raise ValueError(
+                            f"File does not exist: {path}"
                         )
 
-                elif action == "create":
+            for file_data in files:
+                write_file(
+                    repository_path,
+                    file_data["path"],
+                    file_data["content"],
+                )
 
-                    write_file(
-                        repository_path,
-                        relative_path,
-                        content,
-                    )
+            generated = [
+                item["path"]
+                for item in files
+            ]
 
-                    if (
-                        relative_path
-                        not in generated_files
-                    ):
-                        generated_files.append(
-                            relative_path
-                        )
+            modified = [
+                item["path"]
+                for item in files
+                if item["action"] == "modify"
+            ]
 
-            return {
-                **state,
-                "generated_files": generated_files,
-                "modified_files": modified_files,
-                "current_step": "coding_complete",
-            }
+            return generated, modified
 
         except Exception as exc:
-
             last_error = exc
 
-            if attempt < MAX_LLM_RETRIES - 1:
+            if attempt == MAX_LLM_RETRIES:
+                break
 
-                time.sleep(1)
+            message = str(exc).lower()
 
-                prompt = (
-                    build_coder_prompt(
-                        state,
-                        task,
-                        repair_mode=repair_mode,
-                    )
-                    + f"""
-
-PREVIOUS CODER ERROR:
-{exc}
-
-Correct the response.
-
-Remember:
-- Existing files MUST use action "modify".
-- New files MUST use action "create".
-- Repair mode cannot create arbitrary files.
-- Return complete file contents.
-- Return ONLY valid JSON.
-"""
+            if any(
+                word in message
+                for word in (
+                    "rate limit",
+                    "too many requests",
+                    "429",
+                    "tokens per minute",
                 )
+            ):
+                time.sleep(
+                    RATE_LIMIT_WAIT_SECONDS * attempt
+                )
+            else:
+                time.sleep(2)
 
     raise RuntimeError(
-        f"Coder failed on task {task.get('id', 'unknown')}: "
+        f"Coder failed on task {task.get('id')}: "
         f"{last_error}"
     )
 
 
-def coder_agent(
-    state: AgentState,
-) -> AgentState:
-    """
-    Main Coder Agent.
+def coder_agent(state: AgentState) -> AgentState:
+    plan = state.get("plan", [])
 
-    Normal mode:
-        Implements the planned task.
-
-    Repair mode:
-        Uses Debugger output to repair failed code.
-    """
-
-    repair_mode = bool(
-        state.get(
-            "debugger_result"
-        )
-    ) and (
-        state.get(
-            "current_step"
-        ) in {
-            "debugging_complete",
-            "debug_retry",
+    if not plan:
+        return {
+            **state,
+            "current_step": "coding_failed",
+            "errors": [
+                *state.get("errors", []),
+                "Coder: implementation plan is empty.",
+            ],
         }
+
+    if not state.get("repository_path"):
+        return {
+            **state,
+            "current_step": "coding_failed",
+            "errors": [
+                *state.get("errors", []),
+                "Coder: repository path is missing.",
+            ],
+        }
+
+    generated_files = list(
+        state.get("generated_files", [])
+    )
+
+    modified_files = list(
+        state.get("modified_files", [])
+    )
+
+    debugger = state.get(
+        "debugger_result",
+        {},
     )
 
     try:
-
-        if repair_mode:
-
-            debugger_result = state.get(
-                "debugger_result",
-                {}
-            )
-
-            files_to_fix = debugger_result.get(
-                "files_to_fix",
-                []
-            )
+        if debugger:
+            files_to_fix = [
+                normalize_path(path)
+                for path in debugger.get(
+                    "files_to_fix",
+                    [],
+                )
+            ]
 
             if not files_to_fix:
-                return {
-                    **state,
-                    "errors": [
-                        *state.get(
-                            "errors",
-                            [],
-                        ),
-                        (
-                            "Coder repair skipped: "
-                            "Debugger did not identify files to fix."
-                        ),
-                    ],
-                    "current_step": "coding_failed",
-                }
+                raise ValueError(
+                    "Debugger did not identify files to fix."
+                )
 
             repair_task = {
-                "id": 0,
+                "id": state.get(
+                    "current_task_id",
+                    0,
+                ),
                 "title": "Repair failed implementation",
                 "description": (
-                    debugger_result.get(
-                        "diagnosis",
-                        "Repair the implementation based on test failures.",
-                    )
+                    "Repair the files identified by "
+                    "the debugger."
                 ),
                 "files_to_modify": files_to_fix,
                 "files_to_create": [],
-                "dependencies": [],
-                "tests_required": [],
-                "security_considerations": [],
             }
 
-            return execute_task(
+            generated, modified = execute_task(
                 state,
                 repair_task,
                 repair_mode=True,
             )
 
-        plan = state.get(
-            "plan",
-            []
-        )
+            generated_files.extend(
+                path
+                for path in generated
+                if path not in generated_files
+            )
 
-        if not plan:
+            modified_files.extend(
+                path
+                for path in modified
+                if path not in modified_files
+            )
+
             return {
                 **state,
-                "errors": [
-                    *state.get(
-                        "errors",
-                        [],
-                    ),
-                    "Coder: No implementation plan available.",
-                ],
-                "current_step": "coding_failed",
+                "generated_files": generated_files,
+                "modified_files": modified_files,
+                "debugger_result": {},
+                "current_step": "coding_complete",
             }
 
-        current_task_id = state.get(
-            "current_task_id"
-        )
+        for task in plan:
+            task_state = {
+                **state,
+                "current_task_id": task.get("id"),
+            }
 
-        task = None
+            generated, modified = execute_task(
+                task_state,
+                task,
+            )
 
-        if current_task_id is not None:
+            generated_files.extend(
+                path
+                for path in generated
+                if path not in generated_files
+            )
 
-            for planned_task in plan:
-
-                if (
-                    planned_task.get(
-                        "id"
-                    )
-                    == current_task_id
-                ):
-                    task = planned_task
-                    break
-
-        if task is None:
-            task = plan[0]
-
-        return execute_task(
-            state,
-            task,
-            repair_mode=False,
-        )
-
-    except Exception as exc:
+            modified_files.extend(
+                path
+                for path in modified
+                if path not in modified_files
+            )
 
         return {
             **state,
-            "errors": [
-                *state.get(
-                    "errors",
-                    [],
-                ),
-                f"Coder error: {exc}",
-            ],
+            "generated_files": generated_files,
+            "modified_files": modified_files,
+            "current_step": "coding_complete",
+        }
+
+    except Exception as exc:
+        return {
+            **state,
+            "generated_files": generated_files,
+            "modified_files": modified_files,
             "current_step": "coding_failed",
+            "errors": [
+                *state.get("errors", []),
+                f"Coder failed: {exc}",
+            ],
         }

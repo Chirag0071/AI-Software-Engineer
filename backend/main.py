@@ -25,7 +25,7 @@ from fastapi import (
     status,
 )
 from fastapi.security import OAuth2PasswordBearer
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from backend.auth.jwt import (
     create_access_token,
@@ -54,7 +54,10 @@ workflow = build_workflow()
 # ---------------------------------------------------------------------------
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-RUN_STORE_FILE = PROJECT_ROOT / "run_store.json"
+
+RUN_STORE_FILE = (
+    PROJECT_ROOT / "run_store.json"
+)
 
 
 def load_run_store() -> dict[str, AgentState]:
@@ -76,9 +79,14 @@ def load_run_store() -> dict[str, AgentState]:
         if not raw_data.strip():
             return {}
 
-        data = json.loads(raw_data)
+        data = json.loads(
+            raw_data
+        )
 
-        if not isinstance(data, dict):
+        if not isinstance(
+            data,
+            dict,
+        ):
             return {}
 
         return data
@@ -93,6 +101,9 @@ def load_run_store() -> dict[str, AgentState]:
 def save_run_store() -> None:
     """
     Persist all current run states to disk.
+
+    A temporary file is used so that an interrupted
+    write does not normally destroy the existing store.
     """
 
     temporary_file = RUN_STORE_FILE.with_suffix(
@@ -120,7 +131,9 @@ def save_run_store() -> None:
         ) from exc
 
 
-RUN_STORE: dict[str, AgentState] = load_run_store()
+RUN_STORE: dict[str, AgentState] = (
+    load_run_store()
+)
 
 
 # ---------------------------------------------------------------------------
@@ -133,16 +146,27 @@ oauth2_scheme = OAuth2PasswordBearer(
 
 
 def get_current_user(
-    token: str = Depends(oauth2_scheme),
+    token: str = Depends(
+        oauth2_scheme
+    ),
 ) -> dict:
+    """
+    Decode and validate the JWT access token.
+    """
+
     try:
-        payload = verify_token(token)
+        payload = verify_token(
+            token
+        )
+
         return payload
 
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Could not validate credentials",
+            detail=(
+                "Could not validate credentials"
+            ),
             headers={
                 "WWW-Authenticate": "Bearer"
             },
@@ -152,10 +176,18 @@ def get_current_user(
 def require_role(
     required_role: str,
 ):
+    """
+    Create a dependency that requires a specific role.
+    """
+
     def role_checker(
-        user: dict = Depends(get_current_user),
+        user: dict = Depends(
+            get_current_user
+        ),
     ) -> dict:
-        role = user.get("role")
+        role = user.get(
+            "role"
+        )
 
         if role != required_role:
             raise HTTPException(
@@ -177,17 +209,45 @@ def require_role(
 
 
 class TaskRequest(BaseModel):
-    requirement: str
-    repository_path: str
+    """
+    Request body for starting an autonomous
+    software engineering task.
+    """
+
+    requirement: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "Natural-language software requirement."
+        ),
+    )
+
+    repository_path: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "Local path of the repository to modify."
+        ),
+    )
 
 
 class ApprovalRequest(BaseModel):
+    """
+    Human approval request.
+    """
+
     reviewer: str = ""
+
     comment: str = ""
 
 
 class RejectionRequest(BaseModel):
+    """
+    Human rejection request.
+    """
+
     reviewer: str = ""
+
     comment: str = ""
 
 
@@ -288,8 +348,22 @@ def protected_route(
 def run_agent(
     request: TaskRequest,
 ):
+    """
+    Start the autonomous software engineering workflow.
+
+    Request:
+
+    {
+        "requirement": "...",
+        "repository_path": "..."
+    }
+    """
+
     requirement = request.requirement.strip()
-    repository_path = request.repository_path.strip()
+
+    repository_path = (
+        request.repository_path.strip()
+    )
 
     if not requirement:
         raise HTTPException(
@@ -305,29 +379,42 @@ def run_agent(
             ),
         )
 
-    run_id = str(uuid4())
+    run_id = str(
+        uuid4()
+    )
 
     initial_state: AgentState = {
         "user_request": requirement,
         "repository_path": repository_path,
+
         "repository_summary": "",
         "relevant_files": [],
         "repository_files": [],
+
         "repository_architecture": {},
         "architecture_summary": "",
+
         "plan": [],
         "plan_summary": "",
         "current_task_id": 0,
+
         "current_step": "starting",
+
         "generated_files": [],
         "modified_files": [],
+
         "test_results": {},
+
         "debugger_result": {},
         "debug_retry_count": 0,
+
         "review_results": {},
+
         "approval_result": {},
         "approval_required": False,
+
         "github_result": {},
+
         "errors": [],
         "final_response": "",
     }
@@ -377,6 +464,10 @@ def run_agent(
             {},
         )
 
+        # ---------------------------------------------------------------
+        # Determine API response status
+        # ---------------------------------------------------------------
+
         if current_step == (
             "waiting_for_human_approval"
         ):
@@ -406,7 +497,14 @@ def run_agent(
         elif current_step == "completed":
             response_status = "completed"
 
-        elif current_step == "github_pr_created":
+        elif current_step == (
+            "github_pr_created"
+        ):
+            response_status = "completed"
+
+        elif current_step == (
+            "github_pr_already_exists"
+        ):
             response_status = "completed"
 
         elif current_step in {
@@ -428,6 +526,10 @@ def run_agent(
         else:
             response_status = "failed"
 
+        # ---------------------------------------------------------------
+        # Files analyzed
+        # ---------------------------------------------------------------
+
         files_analyzed = [
             file_data["path"]
             for file_data in result.get(
@@ -445,51 +547,74 @@ def run_agent(
 
         return {
             "run_id": run_id,
+
             "status": response_status,
+
             "step": current_step,
+
             "plan_summary": result.get(
                 "plan_summary"
             ),
+
             "plan": result.get(
                 "plan",
                 [],
             ),
+
             "repository_summary": result.get(
                 "repository_summary"
             ),
+
             "architecture_summary": result.get(
                 "architecture_summary"
             ),
+
             "relevant_files": result.get(
                 "relevant_files",
                 [],
             ),
+
             "files_analyzed": files_analyzed,
+
             "generated_files": result.get(
                 "generated_files",
                 [],
             ),
+
             "modified_files": result.get(
                 "modified_files",
                 [],
             ),
+
             "test_results": test_results,
+
             "debugger_result": result.get(
                 "debugger_result",
                 {},
             ),
+
             "debug_retry_count": result.get(
                 "debug_retry_count",
                 0,
             ),
+
             "review_results": review_results,
+
             "review_status": review_status,
-            "approval_required": approval_required,
-            "approval_result": approval_result,
+
+            "approval_required": (
+                approval_required
+            ),
+
+            "approval_result": (
+                approval_result
+            ),
+
             "github_result": result.get(
                 "github_result",
                 {},
             ),
+
             "errors": result.get(
                 "errors",
                 [],
@@ -518,21 +643,29 @@ def run_agent(
             "run_id": run_id,
             "status": "failed",
             "step": "workflow_failed",
+
             "plan_summary": None,
             "plan": [],
+
             "repository_summary": None,
             "architecture_summary": None,
+
             "relevant_files": [],
             "generated_files": [],
             "modified_files": [],
+
             "test_results": {},
             "debugger_result": {},
             "debug_retry_count": 0,
+
             "review_results": {},
             "review_status": None,
+
             "approval_required": False,
             "approval_result": {},
+
             "github_result": {},
+
             "errors": [
                 f"Workflow error: {exc}"
             ],
@@ -548,6 +681,10 @@ def run_agent(
 def get_run(
     run_id: str,
 ):
+    """
+    Retrieve the persisted status of a run.
+    """
+
     state = RUN_STORE.get(
         run_id
     )
@@ -560,38 +697,47 @@ def get_run(
 
     return {
         "run_id": run_id,
+
         "step": state.get(
             "current_step",
             "unknown",
         ),
+
         "approval_required": state.get(
             "approval_required",
             False,
         ),
+
         "approval_result": state.get(
             "approval_result",
             {},
         ),
+
         "github_result": state.get(
             "github_result",
             {},
         ),
+
         "test_results": state.get(
             "test_results",
             {},
         ),
+
         "review_results": state.get(
             "review_results",
             {},
         ),
+
         "generated_files": state.get(
             "generated_files",
             [],
         ),
+
         "modified_files": state.get(
             "modified_files",
             [],
         ),
+
         "errors": state.get(
             "errors",
             [],
@@ -609,6 +755,12 @@ def approve_run(
     run_id: str,
     request: ApprovalRequest,
 ):
+    """
+    Approve a run and create the GitHub Pull Request.
+
+    GitHub operations happen only after explicit approval.
+    """
+
     state = RUN_STORE.get(
         run_id
     )
@@ -631,6 +783,7 @@ def approve_run(
         )
 
     reviewer = request.reviewer.strip()
+
     comment = request.comment.strip()
 
     state["approval_required"] = False
@@ -667,13 +820,32 @@ def approve_run(
             github_result
         )
 
-        if (
-            github_result.get("status")
-            == "created"
-        ):
+        github_status = github_result.get(
+            "status"
+        )
+
+        # ---------------------------------------------------------------
+        # PR successfully created
+        # ---------------------------------------------------------------
+
+        if github_status == "created":
             state["current_step"] = (
                 "github_pr_created"
             )
+
+        # ---------------------------------------------------------------
+        # PR already existed
+        # ---------------------------------------------------------------
+
+        elif github_status == "already_exists":
+            state["current_step"] = (
+                "github_pr_already_exists"
+            )
+
+        # ---------------------------------------------------------------
+        # GitHub operation failed
+        # ---------------------------------------------------------------
+
         else:
             state["current_step"] = (
                 "github_pr_failed"
@@ -698,19 +870,36 @@ def approve_run(
     # Persist approval + GitHub result.
     save_run_store()
 
+    github_status = (
+        state.get(
+            "github_result",
+            {},
+        ).get(
+            "status"
+        )
+    )
+
+    successful = github_status in {
+        "created",
+        "already_exists",
+    }
+
     return {
         "run_id": run_id,
+
         "status": (
             "approved"
-            if state["current_step"]
-            == "github_pr_created"
+            if successful
             else "approval_complete"
         ),
+
         "step": state["current_step"],
+
         "approval_result": state.get(
             "approval_result",
             {},
         ),
+
         "github_result": state.get(
             "github_result",
             {},
@@ -728,6 +917,10 @@ def reject_run(
     run_id: str,
     request: RejectionRequest,
 ):
+    """
+    Reject a run that is waiting for human approval.
+    """
+
     state = RUN_STORE.get(
         run_id
     )
@@ -750,6 +943,7 @@ def reject_run(
         )
 
     reviewer = request.reviewer.strip()
+
     comment = request.comment.strip()
 
     state["approval_required"] = False
@@ -771,10 +965,13 @@ def reject_run(
 
     return {
         "run_id": run_id,
+
         "status": "rejected",
+
         "step": (
             "human_approval_rejected"
         ),
+
         "approval_result": (
             state["approval_result"]
         ),
