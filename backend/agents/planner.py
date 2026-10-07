@@ -1,11 +1,11 @@
+from __future__ import annotations
+
+import json
 import time
 
-from backend.graph.state import AgentState
 from backend.agents.planner_models import ImplementationPlan
-from backend.llm import (
-    get_groq_client,
-    get_model,
-)
+from backend.graph.state import AgentState
+from backend.llm import get_groq_client, get_model
 
 
 PLANNER_SYSTEM_PROMPT = """
@@ -14,11 +14,15 @@ You are the Planner Agent in an autonomous software engineering system.
 Your job is to convert the user's software requirement into a practical,
 ordered implementation plan for the EXISTING repository.
 
-You are given the repository architecture and source context.
+You are given repository intelligence, repository files, architecture,
+and source context.
+
+Return ONLY valid JSON matching the provided JSON schema.
 
 IMPORTANT:
 
-- Return ONLY data matching the provided JSON schema.
+- The tasks array MUST contain at least one task.
+- Never return an empty task list.
 - Do not return Markdown.
 - Do not return explanations outside the schema.
 - Do not write implementation code.
@@ -31,11 +35,11 @@ IMPORTANT:
 
 FILE RULES:
 
-1. If an existing file must be changed, put it in files_to_modify.
-2. If a new file must be created, put it in files_to_create.
+1. Existing files that must change belong in files_to_modify.
+2. New files belong in files_to_create.
 3. Never put an existing file in files_to_create.
 4. Never put a file in both files_to_modify and files_to_create.
-5. Do not describe changing a file without listing it.
+5. Every file mentioned in a task must be explicitly listed.
 6. Reuse existing authentication modules.
 7. If backend/main.py exists, use backend/main.py for application endpoints.
 8. If backend/auth/jwt.py exists, reuse it.
@@ -48,11 +52,15 @@ TASK RULES:
 2. Task IDs must be sequential.
 3. Dependencies must reference earlier task IDs only.
 4. Split the requirement into practical implementation tasks.
-5. Include tests when behavior changes.
-6. Include security considerations for security-sensitive changes.
-7. Keep tasks concise and implementation-focused.
-8. Do not duplicate the same modification across unrelated tasks.
-9. Do not create the same file in multiple tasks.
+5. A requirement that changes behavior MUST contain implementation and test work.
+6. Include tests when behavior changes.
+7. Include security considerations for security-sensitive changes.
+8. Keep tasks concise and implementation-focused.
+9. Do not duplicate the same modification across unrelated tasks.
+10. Do not create the same file in multiple tasks.
+11. Every task must perform meaningful work.
+12. If the requirement is small, one task is acceptable.
+13. Never return zero tasks.
 
 DEPENDENCY RULE:
 
@@ -63,6 +71,19 @@ Example:
 ["1", "2"]
 
 Never use integer dependency IDs.
+
+FINAL CHECK:
+
+Before returning the plan, verify:
+
+- tasks contains at least one task
+- task IDs start at 1
+- task IDs are sequential
+- dependencies reference only earlier tasks
+- existing files are only in files_to_modify
+- new files are only in files_to_create
+- no file is both modified and created
+- tests are included for behavior changes
 """
 
 
@@ -70,21 +91,33 @@ MAX_PLANNER_CONTEXT = 12000
 MAX_RETRIES = 2
 
 
+def normalize_path(path: str) -> str:
+    return path.strip().replace("\\", "/")
+
+
 def build_repository_context(
     state: AgentState,
 ) -> str:
     """
-    Build a compact repository context for the Planner.
+    Build compact but structured repository context
+    for the Planner.
     """
+
+    sections = []
+
+    repository_summary = state.get(
+        "repository_summary",
+        "",
+    )
 
     architecture_summary = state.get(
         "architecture_summary",
         "",
     )
 
-    repository_summary = state.get(
-        "repository_summary",
-        "",
+    architecture = state.get(
+        "repository_architecture",
+        {},
     )
 
     relevant_files = state.get(
@@ -97,13 +130,6 @@ def build_repository_context(
         [],
     )
 
-    sections = []
-
-    if architecture_summary:
-        sections.append(
-            architecture_summary
-        )
-
     if repository_summary:
         sections.append(
             f"""
@@ -114,11 +140,33 @@ REPOSITORY SUMMARY
 """
         )
 
+    if architecture:
+        sections.append(
+            f"""
+STRUCTURED REPOSITORY INTELLIGENCE
+===================================
+
+{json.dumps(architecture, indent=2)}
+"""
+        )
+
+    if architecture_summary:
+        sections.append(
+            f"""
+ARCHITECTURE SUMMARY
+====================
+
+{architecture_summary}
+"""
+        )
+
     if relevant_files:
-        normalized_files = [
-            path.replace("\\", "/")
-            for path in relevant_files
-        ]
+        normalized_files = sorted(
+            {
+                normalize_path(path)
+                for path in relevant_files
+            }
+        )
 
         sections.append(
             """
@@ -133,15 +181,21 @@ REPOSITORY FILE LIST
         )
 
     if repository_files:
-
         file_sections = []
         total_size = 0
 
         for file_data in repository_files:
+            if not isinstance(
+                file_data,
+                dict,
+            ):
+                continue
 
-            path = file_data.get(
-                "path",
-                "",
+            path = normalize_path(
+                file_data.get(
+                    "path",
+                    "",
+                )
             )
 
             content = file_data.get(
@@ -171,6 +225,8 @@ REPOSITORY FILE LIST
 FILE: {path}
 
 {content}
+
+END FILE: {path}
 """
             )
 
@@ -191,10 +247,7 @@ EXISTING SOURCE CONTEXT
 
 def build_planner_schema() -> dict:
     """
-    Native Groq strict JSON schema.
-
-    All fields are required because strict structured
-    output requires complete object definitions.
+    Strict JSON schema for native structured Planner output.
     """
 
     return {
@@ -208,6 +261,7 @@ def build_planner_schema() -> dict:
                 },
                 "tasks": {
                     "type": "array",
+                    "minItems": 1,
                     "items": {
                         "type": "object",
                         "properties": {
@@ -298,16 +352,14 @@ def validate_file_consistency(
     """
 
     existing_files = {
-        path.replace("\\", "/")
+        normalize_path(path)
         for path in relevant_files
     }
 
     created_files = set()
-
     previous_task_ids = set()
 
     for task in plan.tasks:
-
         task_id = task.id
 
         if task_id in previous_task_ids:
@@ -315,17 +367,25 @@ def validate_file_consistency(
                 f"Duplicate task ID: {task_id}"
             )
 
-        previous_task_ids.add(
-            task_id
-        )
+        expected_next_id = len(
+            previous_task_ids
+        ) + 1
+
+        if task_id != expected_next_id:
+            raise ValueError(
+                "Task IDs must be sequential "
+                "starting from 1."
+            )
+
+        previous_task_ids.add(task_id)
 
         modify_files = {
-            path.replace("\\", "/")
+            normalize_path(path)
             for path in task.files_to_modify
         }
 
         create_files = {
-            path.replace("\\", "/")
+            normalize_path(path)
             for path in task.files_to_create
         }
 
@@ -342,7 +402,6 @@ def validate_file_consistency(
             )
 
         for path in modify_files:
-
             if path not in existing_files:
                 raise ValueError(
                     "Planner attempted to modify a "
@@ -350,7 +409,6 @@ def validate_file_consistency(
                 )
 
         for path in create_files:
-
             if path in existing_files:
                 raise ValueError(
                     "Planner attempted to create a "
@@ -363,21 +421,31 @@ def validate_file_consistency(
                     f"same file more than once: {path}"
                 )
 
-            created_files.add(
-                path
-            )
+            created_files.add(path)
 
         for dependency in task.dependencies:
+            if not isinstance(
+                dependency,
+                str,
+            ):
+                raise ValueError(
+                    f"Task {task_id} has a non-string "
+                    "dependency."
+                )
 
-            if dependency not in {
-                str(previous_id)
-                for previous_id in previous_task_ids
-                if previous_id < task_id
-            }:
+            dependency_id = int(dependency)
+
+            if dependency_id >= task_id:
                 raise ValueError(
                     f"Task {task_id} has invalid dependency "
                     f"'{dependency}'. Dependencies must "
                     "reference earlier task IDs."
+                )
+
+            if dependency_id not in previous_task_ids:
+                raise ValueError(
+                    f"Task {task_id} has invalid dependency "
+                    f"'{dependency}'."
                 )
 
 
@@ -443,23 +511,32 @@ REPOSITORY INFORMATION
 
 {repository_context}
 
-Create the implementation plan now.
+CREATE THE IMPLEMENTATION PLAN NOW.
+
+The requirement requires actual repository work.
+
+You MUST return at least one task.
+
+If the requirement is a small change, create one focused
+implementation task containing the required source and test
+changes.
 
 Before returning the structured response, verify:
 
-1. Existing files are only placed in files_to_modify.
-2. New files are only placed in files_to_create.
-3. No existing file is listed in files_to_create.
-4. No file is both modified and created.
-5. backend/main.py is used when application endpoints change.
-6. Existing backend/auth modules are reused.
-7. No .env file is included.
-8. Dependencies are strings referring to earlier task IDs.
-9. Task IDs start at 1 and are sequential.
-10. Tests are included when behavior changes.
-11. Security considerations are included where appropriate.
+1. tasks contains at least one task.
+2. Existing files are only placed in files_to_modify.
+3. New files are only placed in files_to_create.
+4. No existing file is listed in files_to_create.
+5. No file is both modified and created.
+6. backend/main.py is used when application endpoints change.
+7. Existing backend/auth modules are reused.
+8. No .env file is included.
+9. Dependencies are strings referring to earlier task IDs.
+10. Task IDs start at 1 and are sequential.
+11. Tests are included when behavior changes.
+12. Security considerations are included where appropriate.
+13. Every referenced file exists in the repository.
 """
-
 
     last_error = None
 
@@ -467,9 +544,7 @@ Before returning the structured response, verify:
         1,
         MAX_RETRIES + 1,
     ):
-
         try:
-
             client = get_groq_client()
 
             response = client.chat.completions.create(
@@ -498,19 +573,16 @@ Before returning the structured response, verify:
                     "Planner received no response choices from Groq."
                 )
 
-            message = response.choices[0].message
-
-            content = message.content
+            content = (
+                response.choices[0]
+                .message
+                .content
+            )
 
             if not content:
                 raise ValueError(
                     "Planner returned an empty response."
                 )
-
-            # Native strict JSON schema should already produce
-            # valid JSON. We deliberately do not attempt fragile
-            # substring extraction here.
-            import json
 
             plan_data = json.loads(
                 content
@@ -528,7 +600,6 @@ Before returning the structured response, verify:
             return plan
 
         except Exception as exc:
-
             last_error = exc
 
             if attempt >= MAX_RETRIES:
@@ -541,11 +612,12 @@ Before returning the structured response, verify:
             prompt = f"""
 The previous planning attempt failed validation.
 
-Return a complete implementation plan using the
-required JSON schema.
+You MUST return a complete implementation plan.
 
-USER REQUIREMENT
-================
+The tasks array MUST contain at least ONE task.
+
+USER SOFTWARE REQUIREMENT
+=========================
 
 {user_request}
 
@@ -556,6 +628,7 @@ REPOSITORY INFORMATION
 
 STRICT REQUIREMENTS:
 
+- Return at least one task.
 - Use only files from the repository.
 - Existing files belong in files_to_modify.
 - New files belong in files_to_create.
@@ -592,7 +665,10 @@ def planner_agent(
             "plan": [],
             "plan_summary": "",
             "errors": [
-                *state.get("errors", []),
+                *state.get(
+                    "errors",
+                    [],
+                ),
                 "Planner Agent: No user requirement provided.",
             ],
             "current_step": "planning_failed",
@@ -608,7 +684,6 @@ def planner_agent(
     )
 
     try:
-
         implementation_plan = generate_plan(
             user_request,
             repository_context,
@@ -628,7 +703,6 @@ def planner_agent(
         }
 
     except Exception as exc:
-
         return {
             **state,
             "plan": [],
