@@ -1,17 +1,3 @@
-"""
-FastAPI entry point for the Multi-Agent AI Software Engineer.
-
-Provides:
-- Health check
-- Autonomous software engineering workflow
-- Google OAuth development endpoints
-- JWT authentication
-- Admin protected endpoint
-- Persistent run status storage
-- Human approval/rejection
-- GitHub Pull Request creation after approval
-"""
-
 from __future__ import annotations
 
 import json
@@ -41,9 +27,7 @@ from backend.utils.health import health_check
 app = FastAPI(
     title="AI Software Engineer",
     version="1.0.0",
-    description=(
-        "Multi-Agent AI Software Engineering System"
-    ),
+    description="Multi-Agent AI Software Engineering System",
 )
 
 workflow = build_workflow()
@@ -54,10 +38,7 @@ workflow = build_workflow()
 # ---------------------------------------------------------------------------
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-
-RUN_STORE_FILE = (
-    PROJECT_ROOT / "run_store.json"
-)
+RUN_STORE_FILE = PROJECT_ROOT / "run_store.json"
 
 
 def load_run_store() -> dict[str, AgentState]:
@@ -67,34 +48,23 @@ def load_run_store() -> dict[str, AgentState]:
     If the file does not exist or contains invalid JSON,
     return an empty store.
     """
-
     if not RUN_STORE_FILE.exists():
         return {}
 
     try:
-        raw_data = RUN_STORE_FILE.read_text(
-            encoding="utf-8"
-        )
+        raw_data = RUN_STORE_FILE.read_text(encoding="utf-8")
 
         if not raw_data.strip():
             return {}
 
-        data = json.loads(
-            raw_data
-        )
+        data = json.loads(raw_data)
 
-        if not isinstance(
-            data,
-            dict,
-        ):
+        if not isinstance(data, dict):
             return {}
 
         return data
 
-    except (
-        OSError,
-        json.JSONDecodeError,
-    ):
+    except (OSError, json.JSONDecodeError):
         return {}
 
 
@@ -105,10 +75,7 @@ def save_run_store() -> None:
     A temporary file is used so that an interrupted
     write does not normally destroy the existing store.
     """
-
-    temporary_file = RUN_STORE_FILE.with_suffix(
-        ".tmp"
-    )
+    temporary_file = RUN_STORE_FILE.with_suffix(".tmp")
 
     try:
         temporary_file.write_text(
@@ -121,9 +88,7 @@ def save_run_store() -> None:
             encoding="utf-8",
         )
 
-        temporary_file.replace(
-            RUN_STORE_FILE
-        )
+        temporary_file.replace(RUN_STORE_FILE)
 
     except OSError as exc:
         raise RuntimeError(
@@ -131,9 +96,7 @@ def save_run_store() -> None:
         ) from exc
 
 
-RUN_STORE: dict[str, AgentState] = (
-    load_run_store()
-)
+RUN_STORE: dict[str, AgentState] = load_run_store()
 
 
 # ---------------------------------------------------------------------------
@@ -146,48 +109,32 @@ oauth2_scheme = OAuth2PasswordBearer(
 
 
 def get_current_user(
-    token: str = Depends(
-        oauth2_scheme
-    ),
+    token: str = Depends(oauth2_scheme),
 ) -> dict:
     """
     Decode and validate the JWT access token.
     """
-
     try:
-        payload = verify_token(
-            token
-        )
-
+        payload = verify_token(token)
         return payload
 
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=(
-                "Could not validate credentials"
-            ),
-            headers={
-                "WWW-Authenticate": "Bearer"
-            },
+            detail="Could not validate credentials",
+            headers={"WWW-Authenticate": "Bearer"},
         ) from exc
 
 
-def require_role(
-    required_role: str,
-):
+def require_role(required_role: str):
     """
     Create a dependency that requires a specific role.
     """
 
     def role_checker(
-        user: dict = Depends(
-            get_current_user
-        ),
+        user: dict = Depends(get_current_user),
     ) -> dict:
-        role = user.get(
-            "role"
-        )
+        role = user.get("role")
 
         if role != required_role:
             raise HTTPException(
@@ -207,7 +154,6 @@ def require_role(
 # Request models
 # ---------------------------------------------------------------------------
 
-
 class TaskRequest(BaseModel):
     """
     Request body for starting an autonomous
@@ -217,37 +163,34 @@ class TaskRequest(BaseModel):
     requirement: str = Field(
         ...,
         min_length=1,
-        description=(
-            "Natural-language software requirement."
-        ),
+        description="Natural-language software requirement.",
     )
 
     repository_path: str = Field(
         ...,
         min_length=1,
-        description=(
-            "Local path of the repository to modify."
-        ),
+        description="Local path of the repository to modify.",
+    )
+
+    max_debug_retries: int = Field(
+        default=3,
+        ge=0,
+        le=10,
+        description="Maximum number of debugging retries.",
     )
 
 
 class ApprovalRequest(BaseModel):
-    """
-    Human approval request.
-    """
+    """Human approval request."""
 
     reviewer: str = ""
-
     comment: str = ""
 
 
 class RejectionRequest(BaseModel):
-    """
-    Human rejection request.
-    """
+    """Human rejection request."""
 
     reviewer: str = ""
-
     comment: str = ""
 
 
@@ -255,14 +198,10 @@ class RejectionRequest(BaseModel):
 # Basic endpoints
 # ---------------------------------------------------------------------------
 
-
 @app.get("/")
 def root():
     return {
-        "project": (
-            "Multi-Agent AI Software "
-            "Engineering System"
-        ),
+        "project": "Multi-Agent AI Software Engineering System",
         "status": "running",
         "version": "1.0.0",
     }
@@ -277,13 +216,10 @@ def health():
 # Google OAuth development endpoints
 # ---------------------------------------------------------------------------
 
-
 @app.get("/auth/google/login")
 def google_login():
     return {
-        "message": (
-            "Redirect to Google OAuth endpoint."
-        ),
+        "message": "Redirect to Google OAuth endpoint.",
         "auth_url": (
             "https://accounts.google.com/"
             "o/oauth2/v2/auth"
@@ -296,15 +232,11 @@ def google_login():
 
 
 @app.get("/auth/google/callback")
-def google_callback(
-    code: str,
-):
+def google_callback(code: str):
     if not code.strip():
         raise HTTPException(
             status_code=400,
-            detail=(
-                "Authorization code is required."
-            ),
+            detail="Authorization code is required.",
         )
 
     user_info = {
@@ -313,9 +245,7 @@ def google_callback(
         "role": "admin",
     }
 
-    token = create_access_token(
-        user_info
-    )
+    token = create_access_token(user_info)
 
     return {
         "access_token": token,
@@ -325,15 +255,12 @@ def google_callback(
 
 @app.get("/protected")
 def protected_route(
-    user: dict = Depends(
-        require_role("admin")
-    ),
+    user: dict = Depends(require_role("admin")),
 ):
     return {
         "message": (
             f"Hello, {user.get('email')}. "
-            "You have access to protected "
-            "resources."
+            "You have access to protected resources."
         ),
         "user": user,
     }
@@ -343,27 +270,20 @@ def protected_route(
 # Autonomous engineering workflow
 # ---------------------------------------------------------------------------
 
-
 @app.post("/run")
-def run_agent(
-    request: TaskRequest,
-):
+def run_agent(request: TaskRequest):
     """
     Start the autonomous software engineering workflow.
 
-    Request:
-
+    Request body:
     {
         "requirement": "...",
-        "repository_path": "..."
+        "repository_path": "...",
+        "max_debug_retries": 3
     }
     """
-
     requirement = request.requirement.strip()
-
-    repository_path = (
-        request.repository_path.strip()
-    )
+    repository_path = request.repository_path.strip()
 
     if not requirement:
         raise HTTPException(
@@ -374,14 +294,10 @@ def run_agent(
     if not repository_path:
         raise HTTPException(
             status_code=400,
-            detail=(
-                "Repository path is required."
-            ),
+            detail="Repository path is required.",
         )
 
-    run_id = str(
-        uuid4()
-    )
+    run_id = str(uuid4())
 
     initial_state: AgentState = {
         "user_request": requirement,
@@ -407,6 +323,7 @@ def run_agent(
 
         "debugger_result": {},
         "debug_retry_count": 0,
+        "max_debug_retries": request.max_debug_retries,
 
         "review_results": {},
 
@@ -420,9 +337,7 @@ def run_agent(
     }
 
     try:
-        result = workflow.invoke(
-            initial_state
-        )
+        result = workflow.invoke(initial_state)
 
         RUN_STORE[run_id] = result
 
@@ -468,43 +383,28 @@ def run_agent(
         # Determine API response status
         # ---------------------------------------------------------------
 
-        if current_step == (
-            "waiting_for_human_approval"
-        ):
-            response_status = (
-                "waiting_for_approval"
-            )
+        if current_step == "waiting_for_human_approval":
+            response_status = "waiting_for_approval"
 
         elif (
             current_step == "testing_complete"
             and tests_passed
             and not review_results
         ):
-            response_status = (
-                "testing_complete"
-            )
+            response_status = "testing_complete"
 
         elif (
-            current_step
-            == "code_review_complete"
+            current_step == "code_review_complete"
             and tests_passed
             and review_status == "approved"
         ):
-            response_status = (
-                "review_approved"
-            )
+            response_status = "review_approved"
 
-        elif current_step == "completed":
-            response_status = "completed"
-
-        elif current_step == (
-            "github_pr_created"
-        ):
-            response_status = "completed"
-
-        elif current_step == (
-            "github_pr_already_exists"
-        ):
+        elif current_step in {
+            "completed",
+            "github_pr_created",
+            "github_pr_already_exists",
+        }:
             response_status = "completed"
 
         elif current_step in {
@@ -537,10 +437,7 @@ def run_agent(
                 [],
             )
             if (
-                isinstance(
-                    file_data,
-                    dict,
-                )
+                isinstance(file_data, dict)
                 and "path" in file_data
             )
         ]
@@ -602,13 +499,9 @@ def run_agent(
 
             "review_status": review_status,
 
-            "approval_required": (
-                approval_required
-            ),
+            "approval_required": approval_required,
 
-            "approval_result": (
-                approval_result
-            ),
+            "approval_result": approval_result,
 
             "github_result": result.get(
                 "github_result",
@@ -624,12 +517,8 @@ def run_agent(
     except Exception as exc:
         failed_state: AgentState = {
             **initial_state,
-            "current_step": (
-                "workflow_failed"
-            ),
-            "errors": [
-                f"Workflow error: {exc}"
-            ],
+            "current_step": "workflow_failed",
+            "errors": [f"Workflow error: {exc}"],
         }
 
         RUN_STORE[run_id] = failed_state
@@ -651,6 +540,7 @@ def run_agent(
             "architecture_summary": None,
 
             "relevant_files": [],
+            "files_analyzed": [],
             "generated_files": [],
             "modified_files": [],
 
@@ -666,9 +556,7 @@ def run_agent(
 
             "github_result": {},
 
-            "errors": [
-                f"Workflow error: {exc}"
-            ],
+            "errors": [f"Workflow error: {exc}"],
         }
 
 
@@ -676,18 +564,12 @@ def run_agent(
 # Run status
 # ---------------------------------------------------------------------------
 
-
 @app.get("/runs/{run_id}")
-def get_run(
-    run_id: str,
-):
+def get_run(run_id: str):
     """
     Retrieve the persisted status of a run.
     """
-
-    state = RUN_STORE.get(
-        run_id
-    )
+    state = RUN_STORE.get(run_id)
 
     if state is None:
         raise HTTPException(
@@ -749,7 +631,6 @@ def get_run(
 # Human approval
 # ---------------------------------------------------------------------------
 
-
 @app.post("/runs/{run_id}/approve")
 def approve_run(
     run_id: str,
@@ -760,10 +641,7 @@ def approve_run(
 
     GitHub operations happen only after explicit approval.
     """
-
-    state = RUN_STORE.get(
-        run_id
-    )
+    state = RUN_STORE.get(run_id)
 
     if state is None:
         raise HTTPException(
@@ -771,19 +649,13 @@ def approve_run(
             detail="Run not found.",
         )
 
-    if state.get(
-        "current_step"
-    ) != "waiting_for_human_approval":
+    if state.get("current_step") != "waiting_for_human_approval":
         raise HTTPException(
             status_code=409,
-            detail=(
-                "Run is not waiting for "
-                "human approval."
-            ),
+            detail="Run is not waiting for human approval.",
         )
 
     reviewer = request.reviewer.strip()
-
     comment = request.comment.strip()
 
     state["approval_required"] = False
@@ -794,62 +666,37 @@ def approve_run(
         "comment": comment,
     }
 
-    state["current_step"] = (
-        "human_approval_approved"
-    )
+    state["current_step"] = "human_approval_approved"
 
     try:
         github_client = GitHubClient(
             state["repository_path"]
         )
 
-        pr_service = PullRequestService(
-            github_client
+        pr_service = PullRequestService(github_client)
+
+        github_result = pr_service.create_pr_from_approved_state(
+            state=state,
+            run_id=run_id,
+            reviewer=reviewer,
+            comment=comment,
         )
 
-        github_result = (
-            pr_service.create_pr_from_approved_state(
-                state=state,
-                run_id=run_id,
-                reviewer=reviewer,
-                comment=comment,
-            )
-        )
+        state["github_result"] = github_result
 
-        state["github_result"] = (
-            github_result
-        )
+        github_status = github_result.get("status")
 
-        github_status = github_result.get(
-            "status"
-        )
-
-        # ---------------------------------------------------------------
         # PR successfully created
-        # ---------------------------------------------------------------
-
         if github_status == "created":
-            state["current_step"] = (
-                "github_pr_created"
-            )
+            state["current_step"] = "github_pr_created"
 
-        # ---------------------------------------------------------------
         # PR already existed
-        # ---------------------------------------------------------------
-
         elif github_status == "already_exists":
-            state["current_step"] = (
-                "github_pr_already_exists"
-            )
+            state["current_step"] = "github_pr_already_exists"
 
-        # ---------------------------------------------------------------
         # GitHub operation failed
-        # ---------------------------------------------------------------
-
         else:
-            state["current_step"] = (
-                "github_pr_failed"
-            )
+            state["current_step"] = "github_pr_failed"
 
     except Exception as exc:
         state["github_result"] = {
@@ -861,23 +708,17 @@ def approve_run(
             "error": str(exc),
         }
 
-        state["current_step"] = (
-            "github_pr_failed"
-        )
+        state["current_step"] = "github_pr_failed"
 
     RUN_STORE[run_id] = state
 
-    # Persist approval + GitHub result.
+    # Persist approval and GitHub result.
     save_run_store()
 
-    github_status = (
-        state.get(
-            "github_result",
-            {},
-        ).get(
-            "status"
-        )
-    )
+    github_status = state.get(
+        "github_result",
+        {},
+    ).get("status")
 
     successful = github_status in {
         "created",
@@ -911,7 +752,6 @@ def approve_run(
 # Human rejection
 # ---------------------------------------------------------------------------
 
-
 @app.post("/runs/{run_id}/reject")
 def reject_run(
     run_id: str,
@@ -920,10 +760,7 @@ def reject_run(
     """
     Reject a run that is waiting for human approval.
     """
-
-    state = RUN_STORE.get(
-        run_id
-    )
+    state = RUN_STORE.get(run_id)
 
     if state is None:
         raise HTTPException(
@@ -931,19 +768,13 @@ def reject_run(
             detail="Run not found.",
         )
 
-    if state.get(
-        "current_step"
-    ) != "waiting_for_human_approval":
+    if state.get("current_step") != "waiting_for_human_approval":
         raise HTTPException(
             status_code=409,
-            detail=(
-                "Run is not waiting for "
-                "human approval."
-            ),
+            detail="Run is not waiting for human approval.",
         )
 
     reviewer = request.reviewer.strip()
-
     comment = request.comment.strip()
 
     state["approval_required"] = False
@@ -954,9 +785,7 @@ def reject_run(
         "comment": comment,
     }
 
-    state["current_step"] = (
-        "human_approval_rejected"
-    )
+    state["current_step"] = "human_approval_rejected"
 
     RUN_STORE[run_id] = state
 
@@ -965,16 +794,9 @@ def reject_run(
 
     return {
         "run_id": run_id,
-
         "status": "rejected",
-
-        "step": (
-            "human_approval_rejected"
-        ),
-
-        "approval_result": (
-            state["approval_result"]
-        ),
+        "step": "human_approval_rejected",
+        "approval_result": state["approval_result"],
     }
 
 
