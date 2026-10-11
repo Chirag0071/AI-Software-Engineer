@@ -284,8 +284,3 @@ Potential next steps, not currently claimed as implemented:
 - Replace placeholder OAuth behavior with a verified OAuth flow before production deployment.
 - Add deployment instructions and screenshots from the actual running application.
 
-## Author
-
-Chirag
-
-Add your preferred GitHub profile and contact details here before publishing.
