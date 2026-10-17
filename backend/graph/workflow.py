@@ -152,15 +152,15 @@ def route_coder(
 def route_testing(
     state: AgentState,
 ) -> str:
+    test_results = state.get("test_results", {})
 
-    if state.get(
-        "test_results",
-        {},
-    ).get(
-        "success",
-        False,
-    ):
+    if test_results.get("success", False):
         return "code_review"
+
+    # Do not ask the Coder to change application files when pytest itself
+    # could not start or the configured execution environment is unavailable.
+    if test_results.get("failure_kind") == "execution_error":
+        return "end"
 
     retries = state.get(
         "debug_retry_count",

@@ -22,6 +22,14 @@ class TestResults(TypedDict, total=False):
     return_code: int
     stdout: str
     stderr: str
+    command: list[str]
+    duration_seconds: float
+    sandbox: str
+    test_phase: str
+    failed_tests: list[str]
+    failure_kind: str
+    targeted_command: list[str]
+    targeted_test_results: dict
 
 
 class DebuggerResult(TypedDict, total=False):
@@ -87,6 +95,9 @@ class AgentState(TypedDict, total=False):
 
     debugger_result: DebuggerResult
     debug_retry_count: int
+    max_debug_retries: int
+    last_failed_tests: list[str]
+    iteration_count: int
 
     review_results: ReviewResults
 
