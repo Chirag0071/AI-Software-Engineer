@@ -9,3 +9,5 @@ pydantic
 python-jose[cryptography]
 passlib[bcrypt]
 pytest
+streamlit
+requests
