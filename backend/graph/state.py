@@ -108,3 +108,4 @@ class AgentState(TypedDict, total=False):
 
     errors: list[str]
     final_response: str
+    events: list[dict]
