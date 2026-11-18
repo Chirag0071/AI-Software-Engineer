@@ -808,3 +808,97 @@ __all__ = [
     "get_current_user",
     "require_role",
 ]
+
+# ---------------------------------------------------------------------------
+# Live (background) runs - used by the Streamlit dashboard
+# ---------------------------------------------------------------------------
+
+import threading
+
+RUNNING_RUNS: set[str] = set()
+
+
+def _initial_state(requirement: str, repository_path: str, retries: int) -> AgentState:
+    return {
+        "user_request": requirement,
+        "repository_path": repository_path,
+        "repository_summary": "",
+        "relevant_files": [],
+        "repository_files": [],
+        "repository_architecture": {},
+        "architecture_summary": "",
+        "plan": [],
+        "plan_summary": "",
+        "current_task_id": 0,
+        "current_step": "starting",
+        "generated_files": [],
+        "modified_files": [],
+        "test_results": {},
+        "debugger_result": {},
+        "debug_retry_count": 0,
+        "max_debug_retries": retries,
+        "review_results": {},
+        "approval_result": {},
+        "approval_required": False,
+        "github_result": {},
+        "errors": [],
+        "events": [],
+        "final_response": "",
+    }
+
+
+def _execute_run(run_id: str) -> None:
+    try:
+        for snapshot in workflow.stream(RUN_STORE[run_id], stream_mode="values"):
+            RUN_STORE[run_id] = snapshot
+    except Exception as exc:
+        state = dict(RUN_STORE.get(run_id, {}))
+        state["current_step"] = "workflow_failed"
+        state["errors"] = [*state.get("errors", []), f"Workflow error: {exc}"]
+        RUN_STORE[run_id] = state
+    finally:
+        RUNNING_RUNS.discard(run_id)
+        try:
+            save_run_store()
+        except Exception:
+            pass
+
+
+@app.post("/run/start")
+def start_run(request: TaskRequest):
+    """Start a run in the background and return its id immediately."""
+    run_id = str(uuid4())
+    RUN_STORE[run_id] = _initial_state(
+        request.requirement.strip(),
+        request.repository_path.strip(),
+        request.max_debug_retries,
+    )
+    RUNNING_RUNS.add(run_id)
+    threading.Thread(target=_execute_run, args=(run_id,), daemon=True).start()
+    return {"run_id": run_id, "status": "running"}
+
+
+@app.get("/runs")
+def list_runs():
+    return [
+        {
+            "run_id": rid,
+            "requirement": st.get("user_request", ""),
+            "step": st.get("current_step", "unknown"),
+            "running": rid in RUNNING_RUNS,
+        }
+        for rid, st in reversed(list(RUN_STORE.items()))
+    ]
+
+
+@app.get("/runs/{run_id}/full")
+def get_run_full(run_id: str):
+    """Full state of a run (file contents omitted) for the dashboard."""
+    state = RUN_STORE.get(run_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="Run not found.")
+    slim = {k: v for k, v in state.items() if k != "repository_files"}
+    slim["files_analyzed"] = [
+        f["path"] for f in state.get("repository_files", []) if isinstance(f, dict) and "path" in f
+    ]
+    return {"run_id": run_id, "running": run_id in RUNNING_RUNS, "state": slim}
