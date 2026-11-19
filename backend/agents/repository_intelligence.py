@@ -527,7 +527,7 @@ def call_intelligence_llm(
     client = get_groq_client()
 
     response = client.chat.completions.create(
-        model=get_model(),
+        model=get_model("intelligence"),
         messages=[
             {
                 "role": "system",

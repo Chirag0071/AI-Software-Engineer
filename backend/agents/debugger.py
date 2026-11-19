@@ -158,7 +158,7 @@ def is_rate_limit_error(error: Exception) -> bool:
 
 def call_debugger_llm(prompt: str) -> dict:
     response = get_groq_client().chat.completions.create(
-        model=get_model(),
+        model=get_model("debugger"),
         messages=[{"role": "system", "content": DEBUGGER_SYSTEM_PROMPT}, {"role": "user", "content": prompt}],
         temperature=0,
         reasoning_effort="low",

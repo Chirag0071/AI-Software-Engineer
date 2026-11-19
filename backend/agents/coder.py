@@ -434,7 +434,7 @@ def call_coder_llm(prompt: str) -> dict:
     client = get_groq_client()
 
     response = client.chat.completions.create(
-        model=get_model(),
+        model=get_model("coder"),
         messages=[
             {
                 "role": "system",

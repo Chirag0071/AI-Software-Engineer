@@ -548,7 +548,7 @@ Before returning the structured response, verify:
             client = get_groq_client()
 
             response = client.chat.completions.create(
-                model=get_model(),
+                model=get_model("planner"),
                 messages=[
                     {
                         "role": "system",

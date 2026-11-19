@@ -385,7 +385,7 @@ def review_code(
     """
 
     client = get_groq_client()
-    model = get_model()
+    model = get_model("reviewer")
 
     user_request = state.get(
         "user_request",
