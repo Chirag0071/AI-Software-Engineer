@@ -1,5 +1,17 @@
 from __future__ import annotations
 
+import os
+import re
+import subprocess
+import tempfile
+
+from fastapi import Request
+from fastapi.responses import JSONResponse
+
+_GITHUB_URL = re.compile(r"^https://github\.com/[\w.-]+/[\w.-]+?(\.git)?/?$")
+_OPEN_PATHS = {"/", "/health", "/docs", "/openapi.json", "/redoc"}
+
+
 import json
 from pathlib import Path
 from uuid import uuid4
@@ -868,9 +880,10 @@ def _execute_run(run_id: str) -> None:
 def start_run(request: TaskRequest):
     """Start a run in the background and return its id immediately."""
     run_id = str(uuid4())
+    repository = _resolve_repository(request.repository_path.strip(), run_id)
     RUN_STORE[run_id] = _initial_state(
         request.requirement.strip(),
-        request.repository_path.strip(),
+        repository,
         request.max_debug_retries,
     )
     RUNNING_RUNS.add(run_id)
@@ -902,3 +915,50 @@ def get_run_full(run_id: str):
         f["path"] for f in state.get("repository_files", []) if isinstance(f, dict) and "path" in f
     ]
     return {"run_id": run_id, "running": run_id in RUNNING_RUNS, "state": slim}
+
+
+# ---------------------------------------------------------------------------
+# Deployment helpers: API key, GitHub URL cloning, diff endpoint
+# ---------------------------------------------------------------------------
+
+@app.middleware("http")
+async def require_api_key(request: Request, call_next):
+    """If APP_API_KEY is set, every non-public endpoint needs header X-API-Key."""
+    expected = os.getenv("APP_API_KEY", "")
+    if expected and request.url.path not in _OPEN_PATHS:
+        if request.headers.get("x-api-key") != expected:
+            return JSONResponse({"detail": "Invalid or missing API key."}, status_code=401)
+    return await call_next(request)
+
+
+def _resolve_repository(value: str, run_id: str) -> str:
+    """Return a local path. A https://github.com/owner/repo URL is cloned first."""
+    if not value.startswith("https://"):
+        return value
+    if not _GITHUB_URL.match(value):
+        raise HTTPException(status_code=400, detail="Only https://github.com/<owner>/<repo> URLs are supported.")
+    target = Path(tempfile.gettempdir()) / "ai-swe-workspaces" / run_id
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        subprocess.run(
+            ["git", "clone", "--depth", "1", "--", value, str(target)],
+            check=True, capture_output=True, text=True, timeout=120,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        raise HTTPException(status_code=400, detail=f"Could not clone repository: {getattr(exc, 'stderr', exc)}")
+    return str(target)
+
+
+@app.get("/runs/{run_id}/diff")
+def get_run_diff(run_id: str):
+    """Unified diff of the run's changes (tracked edits plus new files)."""
+    state = RUN_STORE.get(run_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="Run not found.")
+    repo = state.get("repository_path", "")
+    try:
+        subprocess.run(["git", "-C", repo, "add", "-N", "."], capture_output=True, timeout=20)
+        out = subprocess.run(["git", "-C", repo, "diff", "HEAD"], capture_output=True, text=True, timeout=20)
+        return {"diff": out.stdout, "error": out.stderr}
+    except Exception as exc:  # noqa: BLE001
+        return {"diff": "", "error": str(exc)}
