@@ -4,6 +4,7 @@ langgraph
 langchain
 langchain-groq
 groq
+openai
 python-dotenv
 pydantic
 python-jose[cryptography]
