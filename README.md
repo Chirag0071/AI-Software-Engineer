@@ -1,286 +1,415 @@
-# Autonomous Multi-Agent AI Software Engineering System
+# 🤖 Autonomous Multi-Agent AI Software Engineer
 
-An AI-assisted software engineering workflow that turns a natural-language requirement into a planned, tested, reviewed code change and prepares a GitHub Pull Request after explicit human approval.
+An autonomous software-engineering workflow that takes a **natural-language requirement**, understands an existing Git repository, **plans, writes code, runs tests, debugs failures, reviews the change**, and — only after **explicit human approval** — opens a **GitHub Pull Request**.
 
-## Overview
+It is built with **LangGraph** (stateful agent orchestration), **FastAPI** (backend API), **Groq** (free LLM inference) and a **Streamlit** dashboard for watching runs live.
 
-The system uses a FastAPI backend and a LangGraph workflow to coordinate specialized agents. It is designed to work against an existing local Git repository.
+> ⚠️ This is a portfolio / learning project. Generated code must always be reviewed by a human before merging. See [Limitations](#limitations).
+
+---
+
+## Table of contents
+
+1. [Features](#features)
+2. [Workflow](#workflow)
+3. [Agents](#agents)
+4. [Technologies used](#technologies-used)
+5. [Project structure](#project-structure)
+6. [Setup & run commands](#setup--run-commands)
+7. [Environment variables](#environment-variables)
+8. [Streamlit dashboard](#streamlit-dashboard)
+9. [API reference](#api-reference)
+10. [External APIs used](#external-apis-used)
+11. [Testing](#testing)
+12. [How it works (detailed)](#how-it-works-detailed)
+13. [Safety & security notes](#safety--security-notes)
+14. [Limitations](#limitations)
+15. [Roadmap](#roadmap)
+
+---
+
+## Features
+
+- **Repository analysis** – scans the target repository (skips `.git`, `.venv`, `node_modules`, `__pycache__`, `.pytest_cache`; blocks `.env`).
+- **Repository intelligence** – LLM-assisted selection of relevant files plus an architecture summary.
+- **Structured planning** – requirement → ordered tasks with files to create/modify, tests required and security considerations (validated with Pydantic).
+- **Code generation** – the Coder creates/modifies only files authorised by the plan, through path-safe file tools.
+- **Automated testing** – runs `pytest` in the target repository (local mode by default, optional Docker mode with resource limits).
+- **Bounded self-correction loop** – failing tests → Debugger diagnosis → Coder repair → re-test, capped by `max_debug_retries` (0–10).
+- **Code review** – LLM review with severity-rated issues, strengths and security concerns.
+- **Human-in-the-loop** – the workflow pauses at `waiting_for_human_approval`; nothing touches GitHub until a human approves.
+- **GitHub PR creation** – creates a branch, commits and opens (or detects an existing) pull request.
+- **Persistence** – run state is saved to `run_store.json` and survives restarts.
+- **Live dashboard** – Streamlit UI with pipeline progress, plan, diff, test output, review, timeline and Approve / Reject buttons.
+- **Auth utilities** – JWT creation/verification and role helpers (`admin`, `user`, `guest`).
+
+---
 
 ## Workflow
 
-```text
-Natural-language requirement
-          |
-          v
- Repository Analyst
-          |
-          v
- Repository Intelligence
-          |
-          v
-       Planner
-          |
-          v
-        Coder
-          |
-          v
-     Test Agent
-          |
-          +------ Tests fail ------> Debugger
-          |                             |
-          |                             v
-          |                       Coder repair
-          |                             |
-          +<----------------------------+
-          |
-     Tests pass
-          |
-          v
-     Code Review
-          |
-          v
-   Human approval
-          |
-          v
- GitHub Pull Request
+```mermaid
+flowchart TD
+    A[Requirement + repository path] --> B[Repository Analyst]
+    B --> C[Repository Intelligence]
+    C --> D[Planner]
+    D --> E[Coder]
+    E --> F[Test Agent]
+    F -->|tests pass| G[Code Review]
+    F -->|tests fail & retries left| H[Debugger]
+    H --> I[prepare_debug_retry]
+    I --> E
+    F -->|retries exhausted / execution error| X[End: failed]
+    G -->|approved| J[Human Approval - workflow pauses]
+    G -->|changes requested| X
+    J -->|POST /approve| K[GitHub Pull Request]
+    J -->|POST /reject| Y[End: rejected]
 ```
 
-The debugger/repair cycle is bounded by the configured maximum retry count. GitHub Pull Request creation is performed only after the approval endpoint accepts an explicit approval for a run that is waiting for human approval.
+Text version:
 
-## Main capabilities
+```text
+Requirement
+   → Repository Analyst → Repository Intelligence → Planner → Coder → Test Agent
+                                                                        │
+                       ┌──────────── tests fail (retries left) ─────────┤
+                       ▼                                                │ tests pass
+                   Debugger → prepare_debug_retry → Coder               ▼
+                                                                  Code Review
+                                                                        │ approved
+                                                                        ▼
+                                                      Human Approval (pause) → GitHub PR
+```
 
-- **Repository analysis:** scans the target repository to discover project files.
-- **Repository intelligence:** identifies relevant files and summarizes the repository's architecture and relationships.
-- **Task planning:** converts a requirement into an ordered implementation plan.
-- **Code generation:** creates or modifies files authorized by the plan.
-- **Automated testing:** runs the project's tests and records the results.
-- **Debugging loop:** diagnoses test failures and sends the repair context back to the coder, subject to a retry limit.
-- **Code review:** evaluates the proposed changes before approval.
-- **Human approval:** pauses the workflow until a reviewer approves or rejects the proposed change.
-- **GitHub PR creation:** creates or detects an existing pull request after approval.
-- **Run persistence:** saves workflow state to `run_store.json` so run status can be retrieved after a backend restart.
+**Stopping conditions:** tests pass · retry budget exhausted · pytest could not start (`execution_error`) · debugger has no files to fix · review requests changes · a human rejects.
 
-## Technology stack
+---
 
-- Python 3.11
-- FastAPI
-- LangGraph
-- Pydantic
-- Groq / `langchain-groq` for supported LLM workflows
-- Pytest
-- Git and GitHub API integration
-- JWT-based authentication utilities
+## Agents
 
-Check the project's `requirements.txt` and `.env` loading code for the exact versions and configuration required by your checkout.
+| Agent | File | Responsibility |
+|---|---|---|
+| Repository Analyst | `backend/agents/repository.py` | Scans the repo and loads file contents into state |
+| Repository Intelligence | `backend/agents/repository_intelligence.py` | Picks relevant files, summarises architecture |
+| Planner | `backend/agents/planner.py` (+ `planner_models.py`) | Produces a validated implementation plan |
+| Coder | `backend/agents/coder.py` | Writes/modifies files via safe filesystem tools; handles LLM rate limits with retry |
+| Test Agent | `backend/agents/test_agent.py` | Runs pytest, classifies failures |
+| Debugger | `backend/agents/debugger.py` | Analyses failures, lists files to fix and instructions |
+| Code Review | `backend/agents/code_review.py` | Correctness, maintainability and security review |
+| Human Approval | `backend/agents/human_approval.py` | Pauses the workflow for a human decision |
+| GitHub PR service | `backend/github/pr_service.py` | Branch → commit → push → PR |
+
+Each node is wrapped by `wrap_agent`, which records `started` / `completed` / `failed` **events** with timestamps (these feed the dashboard timeline) and converts exceptions into workflow errors.
+
+---
+
+## Technologies used
+
+| Area | Technology |
+|---|---|
+| Language | Python 3.11+ |
+| Agent orchestration | **LangGraph** (`StateGraph`, conditional edges), LangChain |
+| LLM provider | **Groq** (`groq`, `langchain-groq`) — default model `openai/gpt-oss-20b` |
+| Backend API | **FastAPI** + Uvicorn |
+| Data validation | **Pydantic** |
+| Frontend | **Streamlit** + `requests` |
+| Auth | `python-jose` (JWT), `passlib[bcrypt]` |
+| Testing | **Pytest** |
+| Version control / PRs | Git + **GitHub REST API** |
+| Config | `python-dotenv` |
+| Optional sandbox | Docker (`--network none`, CPU/memory/PID limits) |
+
+---
 
 ## Project structure
-
-The main components are organized approximately as follows:
 
 ```text
 AI-Software-Engineer/
 ├── backend/
+│   ├── main.py                    # FastAPI app: run, status, approve/reject, live-run endpoints
+│   ├── llm.py                     # Groq client / model configuration
 │   ├── agents/
-│   │   ├── repository.py
+│   │   ├── repository.py          # Repository Analyst
 │   │   ├── repository_intelligence.py
 │   │   ├── planner.py
+│   │   ├── planner_models.py      # Pydantic plan schemas
 │   │   ├── coder.py
 │   │   ├── test_agent.py
 │   │   ├── debugger.py
 │   │   ├── code_review.py
-│   │   └── human_approval.py
-│   ├── auth/
-│   ├── github/
+│   │   ├── human_approval.py
+│   │   └── conftest.py
 │   ├── graph/
-│   │   ├── state.py
-│   │   └── workflow.py
+│   │   ├── state.py               # AgentState (TypedDict) — shared workflow state
+│   │   └── workflow.py            # LangGraph definition, routing, retry logic
 │   ├── tools/
-│   ├── utils/
-│   └── main.py
-├── test-target-repo/
+│   │   ├── filesystem.py          # Path-safe read/write, ignored dirs, blocked files
+│   │   ├── repository.py          # Repository scanning helpers
+│   │   └── test_runner.py         # Local / Docker pytest runner, target validation
+│   ├── github/
+│   │   ├── client.py              # GitHub REST client
+│   │   └── pr_service.py          # Branch/commit/PR orchestration
+│   ├── auth/
+│   │   ├── jwt.py                 # Token creation / verification
+│   │   ├── dependencies.py        # FastAPI auth dependencies
+│   │   ├── roles.py               # admin / user / guest helpers
+│   │   └── google.py              # Google OAuth helpers (development placeholder)
+│   └── utils/health.py            # Health check
+├── frontend/
+│   └── app.py                     # Streamlit dashboard
+├── tests/                         # 38 automated tests
+│   ├── test_auth.py
+│   ├── test_approval_api.py
+│   ├── test_debugging.py
+│   ├── test_github_client.py
+│   ├── test_health.py
+│   ├── test_human_approval.py
+│   └── test_system.py
+├── test-target-repo/              # Disposable repo to try the agent on
 ├── requirements.txt
-├── run_store.json
+├── pytest.ini
+├── .env.example
+├── .gitignore
+├── LICENSE
 └── README.md
 ```
 
-The exact file list may differ slightly by branch.
+---
 
-## Prerequisites
+## Setup & run commands
 
-- Python 3.11
-- Git
-- A Groq API key if your configured agents use Groq
-- A GitHub token with appropriate repository permissions if you want to create pull requests
-- Access to a Git repository that you are authorized to modify
+### 1. Clone and create a virtual environment
 
-Docker is optional if the test runner supports a Docker execution mode in your current checkout. Local test execution is the default in the described setup.
-
-## Installation on Windows
-
-Open PowerShell in the project directory.
-
-### 1. Create and activate a virtual environment
-
+**Windows (PowerShell)**
 ```powershell
-cd D:\pro\AI-Software-Engineer
-
+git clone https://github.com/Chirag0071/AI-Software-Engineer.git
+cd AI-Software-Engineer
 py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 ```
 
-### 2. Install dependencies
+**Linux / macOS**
+```bash
+git clone https://github.com/Chirag0071/AI-Software-Engineer.git
+cd AI-Software-Engineer
+python3 -m venv .venv
+source .venv/bin/activate
+```
 
-```powershell
+### 2. Install dependencies
+```bash
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-### 3. Configure environment variables
+### 3. Configure environment
+```bash
+cp .env.example .env        # Windows: copy .env.example .env
+```
+Then edit `.env` (see [Environment variables](#environment-variables)). A free Groq key is available at <https://console.groq.com>.
 
-Create a local `.env` file using the variable names expected by the project's configuration code. Common settings for this project include:
-
-```env
-LLM_PROVIDER=groq
-GROQ_API_KEY=your_groq_api_key
-MODEL=openai/gpt-oss-20b
-SECRET_KEY=replace_with_a_long_random_secret
-GITHUB_TOKEN=your_github_token
-GITHUB_OWNER=your_github_username_or_organization
-GITHUB_REPO=your_target_repository
-GITHUB_BASE_BRANCH=main
+### 4. Prepare a target repository
+The agent edits a **separate** Git repository. Use a disposable one:
+```bash
+mkdir test-target-repo && cd test-target-repo
+git init
+printf 'def add(a, b):\n    return a + b\n' > app.py
+git add . && git commit -m "init"
+cd ..
 ```
 
-These are example values, not a guarantee that every variable name is consumed by every module. Verify names against your current configuration code before running. **Never commit `.env`, API keys, access tokens, or real secrets to Git.**
-
-### 4. Start the API
-
-```powershell
+### 5. Start the backend (terminal 1)
+```bash
 uvicorn backend.main:app --reload
 ```
+- Swagger UI: <http://127.0.0.1:8000/docs>
+- Health: <http://127.0.0.1:8000/health>
 
-The API should be available at:
-
-- Swagger UI: http://127.0.0.1:8000/docs
-- Root endpoint: http://127.0.0.1:8000/
-- Health endpoint: http://127.0.0.1:8000/health
-
-Stop the development server with `Ctrl+C`.
-
-## API workflow
-
-### Start a software engineering run
-
-Use `POST /run` with a JSON body similar to:
-
-```json
-{
-  "requirement": "Add a multiply(a, b) function to app.py and add pytest tests for it.",
-  "repository_path": "D:\\path\\to\\your\\target-repository",
-  "max_debug_retries": 3
-}
+### 6. Start the dashboard (terminal 2)
+```bash
+streamlit run frontend/app.py
+```
+Open <http://localhost:8501>. If the backend is not on the default address:
+```bash
+BACKEND_URL=http://127.0.0.1:8000 streamlit run frontend/app.py
 ```
 
-Use an existing repository path that the process can access. The retry count must be between 0 and 10; the default is 3.
-
-The response includes the run ID, current step/status, plan, analyzed files, test results, review results, approval information, GitHub result, and any errors reported by the workflow.
-
-### Retrieve run status
-
-Use `GET /runs/{run_id}`, replacing `{run_id}` with the ID returned by `POST /run`.
-
-### Approve a run
-
-Only approve a run after checking the proposed change and confirming that its status is waiting for human approval.
-
-`POST /runs/{run_id}/approve`
-
-Example body:
-
-```json
-{
-  "reviewer": "human",
-  "comment": "Reviewed and approved."
-}
+### 7. Run the tests
+```bash
+# Linux / macOS
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q
 ```
-
-The backend attempts GitHub Pull Request creation after approval.
-
-### Reject a run
-
-`POST /runs/{run_id}/reject`
-
-Example body:
-
-```json
-{
-  "reviewer": "human",
-  "comment": "Changes need further review."
-}
-```
-
-Explore `/docs` for the exact request and response schemas in the running version.
-
-## Run tests
-
-From the project root:
-
 ```powershell
+# Windows PowerShell
 $env:PYTEST_DISABLE_PLUGIN_AUTOLOAD = "1"
 python -m pytest -q
 ```
 
-To validate the retry request model:
+### Optional: Docker execution mode
+```bash
+EXECUTION_MODE=docker SANDBOX_DOCKER_IMAGE=ai-software-engineer-sandbox:latest uvicorn backend.main:app
+```
+Requires Docker and a sandbox image containing Python and pytest (image build file is not included yet).
 
-```powershell
-python -c "from backend.main import TaskRequest; print(TaskRequest(requirement='Add a function', repository_path='.', max_debug_retries=5).max_debug_retries)"
+---
+
+## Environment variables
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `LLM_PROVIDER` | No (default `groq`) | Only `groq` is supported |
+| `GROQ_API_KEY` | **Yes** | Groq API key |
+| `MODEL` | No (default `openai/gpt-oss-20b`) | Groq model name |
+| `SECRET_KEY` | **Yes** | Signs JWT tokens — use a long random value |
+| `GITHUB_TOKEN` | For PRs | Token with repo permissions |
+| `GITHUB_OWNER` | For PRs | GitHub user/org that owns the target repo |
+| `GITHUB_REPO` | For PRs | Target repository name |
+| `GITHUB_BASE_BRANCH` | No (default `main`) | Branch PRs are opened against |
+| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | No | Only for the Google OAuth helper |
+| `EXECUTION_MODE` | No (default `local`) | `local` or `docker` |
+| `TEST_TIMEOUT_SECONDS` | No (default `120`) | Test run timeout |
+| `SANDBOX_DOCKER_IMAGE` | No | Docker image for sandboxed tests |
+| `SANDBOX_CPUS` / `SANDBOX_MEMORY` / `SANDBOX_PIDS` | No | Docker limits (`1` / `512m` / `128`) |
+| `BACKEND_URL` | No | Used by the Streamlit app (default `http://127.0.0.1:8000`) |
+
+> **Never commit `.env`.** Keep tokens out of source control.
+
+---
+
+## Streamlit dashboard
+
+1. Enter the **repository path** and a **requirement** in the sidebar, choose max debug retries, press **🚀 Start run**.
+2. Watch the **pipeline strip** (Analyst → Intelligence → Planner → Coder → Tests → Debugger → Review → Approval) update live (refreshes every 2 s).
+3. Inspect the tabs:
+
+| Tab | Shows |
+|---|---|
+| 📋 Plan | Plan summary and task breakdown |
+| 📂 Context | Repository summary, architecture, relevant files |
+| 🧾 Changes | Created/modified files and the real `git diff` |
+| 🧪 Tests | Pytest output, duration, sandbox mode, debugger diagnosis |
+| 🔎 Review | Review verdict, severity-tagged issues, security concerns |
+| 🕒 Timeline | Per-agent started / completed / failed events |
+| ✅ Approval | Approve & create PR / Reject controls |
+
+The header shows status, current step, debug retries used and test status. Previous runs can be reopened from the sidebar.
+
+---
+
+## API reference
+
+Base URL: `http://127.0.0.1:8000` — interactive docs at `/docs`.
+
+| Method | Endpoint | Description |
+|---|---|---|
+| GET | `/` | Project info |
+| GET | `/health` | Health check (`status`, `workflow`) |
+| POST | `/run` | Run the full workflow **synchronously**; returns the final result |
+| POST | `/run/start` | Start a run in the **background**; returns `run_id` immediately |
+| GET | `/runs` | List runs (id, requirement, step, running flag) |
+| GET | `/runs/{run_id}` | Summary status of a run |
+| GET | `/runs/{run_id}/full` | Full run state (plan, events, tests, review…) — used by the dashboard |
+| POST | `/runs/{run_id}/approve` | Approve a run waiting for approval and create the GitHub PR |
+| POST | `/runs/{run_id}/reject` | Reject a run |
+| GET | `/auth/google/login` | Placeholder Google OAuth URL |
+| GET | `/auth/google/callback?code=` | **Development placeholder** that issues a JWT |
+| GET | `/protected` | Example admin-only route (JWT, role `admin`) |
+
+**Start a run**
+```bash
+curl -X POST http://127.0.0.1:8000/run/start \
+  -H "Content-Type: application/json" \
+  -d '{"requirement":"Add a multiply(a, b) function to app.py and add pytest tests","repository_path":"/path/to/test-target-repo","max_debug_retries":3}'
 ```
 
-Expected output:
-
-```text
-5
+**Approve**
+```bash
+curl -X POST http://127.0.0.1:8000/runs/<run_id>/approve \
+  -H "Content-Type: application/json" \
+  -d '{"reviewer":"human","comment":"Reviewed and approved."}'
 ```
 
-A retry value greater than 10 should fail Pydantic validation.
+**Run status values:** `waiting_for_approval`, `review_approved`, `testing_complete`, `completed`, `failed`.
 
-## Safety and operational notes
+---
 
-- Run the system only against repositories you own or are authorized to modify.
-- Review generated changes before approval; automated tests and code review are not a guarantee of correctness or security.
-- Keep credentials in environment variables or a secrets manager, not in source control.
-- The repository scanner excludes selected directories and `.env`; verify the current scanner and filesystem safeguards before using this system with sensitive repositories.
-- Local test execution runs code from the target repository. Use a disposable checkout or a properly isolated environment for untrusted code.
-- GitHub permissions should be limited to what the workflow requires.
-- The Google OAuth endpoints in the current development implementation are placeholders; they are not a production-ready Google OAuth integration.
-- `run_store.json` may contain repository paths, requirements, generated content, and run details. Protect it and avoid committing sensitive run data.
+## External APIs used
 
-## Current limitations
+| API | Used for |
+|---|---|
+| **Groq API** (OpenAI-compatible chat completions, via `groq` and `langchain-groq`) | Planning, repository intelligence, coding, debugging, code review |
+| **GitHub REST API** (`https://api.github.com`) | Creating branches, commits and pull requests |
+| **Google OAuth 2.0** | Placeholder endpoints only — not a production integration |
 
-- LLM output quality depends on the selected model, prompts, available context, and API availability.
-- The system relies on the target repository's test setup; it does not guarantee that all project-specific dependencies are installed.
-- Human approval is an explicit workflow gate, but reviewers must still inspect the actual changes and CI results.
-- Production deployment would require additional work around real OAuth integration, secret management, access controls, concurrency, audit logging, and isolation of untrusted code execution.
+---
 
-## Demonstration scenario
+## Testing
 
-Use a disposable target repository for the demonstration:
+**38 automated tests — 38 passed** (`pytest -q`, ~3 s).
 
-1. Start the FastAPI server and open `/docs`.
-2. Submit a requirement to add a small function and its tests.
-3. Show the repository analysis, generated plan, and changed files.
-4. Show the automated test results and code review status.
-5. Demonstrate that the workflow pauses for human approval.
-6. Approve the run and show the resulting GitHub Pull Request.
-7. Open the PR and inspect the diff and tests.
+| Test file | Tests | Covers |
+|---|---:|---|
+| `tests/test_github_client.py` | 13 | GitHub client behaviour |
+| `tests/test_debugging.py` | 8 | Debugger / retry logic |
+| `tests/test_approval_api.py` | 7 | Approve / reject API |
+| `tests/test_auth.py` | 4 | JWT and auth |
+| `tests/test_system.py` | 3 | Planner schemas and normalisation |
+| `tests/test_human_approval.py` | 2 | Approval agent gate |
+| `tests/test_health.py` | 1 | Health contract |
+| **Total** | **38** | |
 
-## Future improvements
+The live dashboard and background-run endpoints were additionally verified end to end using stubbed agents (no LLM calls). Real LLM output quality depends on the model and has not been benchmarked yet — see [Roadmap](#roadmap).
 
-Potential next steps, not currently claimed as implemented:
+---
 
-- Add CI checks for linting, type checking, and security scanning.
-- Improve sandboxing for test execution.
-- Add richer run observability and structured logs.
-- Add integration tests for approval and GitHub PR creation.
-- Replace placeholder OAuth behavior with a verified OAuth flow before production deployment.
-- Add deployment instructions and screenshots from the actual running application.
+## How it works (detailed)
 
+1. **State.** All agents read and write a single `AgentState` (requirement, repository path, plan, files, test results, debugger result, review results, approval and GitHub results, retry counters, errors, events).
+2. **Graph.** `backend/graph/workflow.py` builds a LangGraph `StateGraph`. Conditional edges decide the next node (`route_testing`, `route_debugger`, `route_code_review`, …).
+3. **Retry loop.** On failing tests the Debugger proposes `files_to_fix` and `fix_instructions`; `prepare_debug_retry` increments `debug_retry_count` and sends control back to the Coder. When `debug_retry_count >= max_debug_retries` the run ends.
+4. **Tools.** File access goes through `get_safe_path` (rejects paths outside the repository); test targets are validated to be existing `.py` files inside the repo and may not start with `-`.
+5. **Approval gate.** `human_approval_agent` marks the run `waiting_for_human_approval` only when the review status is `approved`. The PR is created only from `POST /runs/{id}/approve`.
+6. **Live runs.** `POST /run/start` executes `workflow.stream(...)` in a background thread and stores the latest state after every node, so `GET /runs/{id}/full` reflects progress in real time.
+7. **Persistence.** State is written atomically to `run_store.json`.
+
+---
+
+## Safety & security notes
+
+- Only run against repositories you own or are authorised to modify; use a disposable checkout.
+- **Local test mode executes code from the target repository on your machine.** Use Docker mode or an isolated environment for untrusted code.
+- Rate-limit handling for Groq is built into the Coder (retry/wait), but free-tier limits may still interrupt long runs.
+- `run_store.json` may contain paths, requirements and generated code — keep it out of Git (add it to `.gitignore`).
+- The `/auth/google/callback` endpoint is a **development placeholder**: it issues a token without verifying the Google code. Do **not** expose it publicly.
+- The approve/reject endpoints are not currently protected by JWT roles. Add authentication before exposing the API beyond localhost.
+
+---
+
+## Limitations
+
+- Output quality depends on the Groq model (the default is a small model); complex multi-file tasks may fail or need several retries.
+- No vector search / embeddings: repository context selection is LLM-based, not RAG.
+- No database: runs are stored in a JSON file; runs execute in-process threads (no job queue).
+- Test execution is local by default; the Docker sandbox image is not yet provided.
+- No dedicated Security Agent (security concerns come from the Code Review agent) and no Documentation Agent.
+- No automated benchmark or cost/latency tracking yet, so no performance numbers are claimed.
+- Python projects with `pytest` only.
+
+---
+
+## Roadmap
+
+- [ ] Dedicated Security Agent
+- [ ] Benchmark suite of small tasks with measured success rate, retries and latency
+- [ ] Token / cost / latency tracking on the dashboard
+- [ ] Dockerfile and sandbox image; `docker-compose` setup
+- [ ] GitHub Actions CI (pytest on every push)
+- [ ] Lightweight RAG with local embeddings
+- [ ] SQLite/PostgreSQL storage for runs and events
+- [ ] Real Google OAuth and JWT protection on approval endpoints
+- [ ] Dashboard screenshots and demo video
+
+---
+
+## License
+
+See [LICENSE](LICENSE).
