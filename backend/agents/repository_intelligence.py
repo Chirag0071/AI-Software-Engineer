@@ -5,12 +5,16 @@ import time
 from pathlib import Path
 
 from backend.graph.state import AgentState
-from backend.llm import get_groq_client, get_model
+from backend.llm import (
+    get_context_char_limit,
+    get_file_char_limit,
+    get_llm_client,
+    get_model,
+    get_output_token_limit,
+)
 from backend.tools.filesystem import read_file
 
 
-MAX_FILE_SIZE = 10_000
-MAX_TOTAL_CONTEXT = 30_000
 MAX_LLM_RETRIES = 2
 RATE_LIMIT_WAIT_SECONDS = 15
 
@@ -233,9 +237,11 @@ def read_repository_context(
 
     context = []
     total_size = 0
+    max_context_chars = get_context_char_limit()
+    max_file_chars = get_file_char_limit()
 
     for relative_path in files:
-        if total_size >= MAX_TOTAL_CONTEXT:
+        if total_size >= max_context_chars:
             break
 
         try:
@@ -246,14 +252,14 @@ def read_repository_context(
         except Exception:
             continue
 
-        if len(content) > MAX_FILE_SIZE:
+        if len(content) > max_file_chars:
             content = (
-                content[:MAX_FILE_SIZE]
+                content[:max_file_chars]
                 + "\n[FILE CONTEXT TRUNCATED]"
             )
 
         remaining = (
-            MAX_TOTAL_CONTEXT - total_size
+            max_context_chars - total_size
         )
 
         if len(content) > remaining:
@@ -347,6 +353,14 @@ END FILE: {item["path"]}
 """
         )
 
+    prompt_classifications = {
+        name: paths[:100]
+        for name, paths in classifications.items()
+    }
+    repository_summary = str(
+        state.get("repository_summary", "")
+    )[:4_000]
+
     return f"""
 USER REQUIREMENT
 ================
@@ -356,12 +370,12 @@ USER REQUIREMENT
 REPOSITORY SUMMARY
 ==================
 
-{state.get("repository_summary", "")}
+{repository_summary}
 
 FILE CLASSIFICATION
 ===================
 
-{json.dumps(classifications, indent=2)}
+{json.dumps(prompt_classifications, separators=(",", ":"))}
 
 REPOSITORY CONTENT
 ==================
@@ -524,7 +538,7 @@ def build_intelligence_schema() -> dict:
 def call_intelligence_llm(
     prompt: str,
 ) -> dict:
-    client = get_groq_client()
+    client = get_llm_client()
 
     response = client.chat.completions.create(
         model=get_model("intelligence"),
@@ -542,7 +556,7 @@ def call_intelligence_llm(
         ],
         temperature=0,
         reasoning_effort="low",
-        max_tokens=10_000,
+        max_tokens=get_output_token_limit(12_000, agent="intelligence"),
         response_format={
             "type": "json_schema",
             "json_schema": build_intelligence_schema(),

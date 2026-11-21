@@ -2,7 +2,7 @@
 
 An autonomous software-engineering workflow that takes a **natural-language requirement**, understands an existing Git repository, **plans, writes code, runs tests, debugs failures, reviews the change**, and — only after **explicit human approval** — opens a **GitHub Pull Request**.
 
-It is built with **LangGraph** (stateful agent orchestration), **FastAPI** (backend API), **Groq** (free LLM inference) and a **Streamlit** dashboard for watching runs live.
+It is built with **LangGraph** (stateful agent orchestration), **FastAPI** (backend API), **OpenRouter** (NVIDIA Nemotron 3 Ultra) and a **Streamlit** dashboard for watching runs live.
 
 > ⚠️ This is a portfolio / learning project. Generated code must always be reviewed by a human before merging. See [Limitations](#limitations).
 
@@ -108,7 +108,7 @@ Each node is wrapped by `wrap_agent`, which records `started` / `completed` / `f
 |---|---|
 | Language | Python 3.11+ |
 | Agent orchestration | **LangGraph** (`StateGraph`, conditional edges), LangChain |
-| LLM provider | **Groq** (`groq`, `langchain-groq`) — default model `openai/gpt-oss-20b` |
+| LLM provider | **OpenRouter** with `nvidia/nemotron-3-ultra-550b-a55b:free` |
 | Backend API | **FastAPI** + Uvicorn |
 | Data validation | **Pydantic** |
 | Frontend | **Streamlit** + `requests` |
@@ -126,7 +126,7 @@ Each node is wrapped by `wrap_agent`, which records `started` / `completed` / `f
 AI-Software-Engineer/
 ├── backend/
 │   ├── main.py                    # FastAPI app: run, status, approve/reject, live-run endpoints
-│   ├── llm.py                     # Groq client / model configuration
+│   ├── llm.py                     # Provider, model, and request configuration
 │   ├── agents/
 │   │   ├── repository.py          # Repository Analyst
 │   │   ├── repository_intelligence.py
@@ -205,7 +205,7 @@ pip install -r requirements.txt
 ```bash
 cp .env.example .env        # Windows: copy .env.example .env
 ```
-Then edit `.env` (see [Environment variables](#environment-variables)). A free Groq key is available at <https://console.groq.com>.
+Then edit `.env` (see [Environment variables](#environment-variables)) and add your OpenRouter API key.
 
 ### 4. Prepare a target repository
 The agent edits a **separate** Git repository. Use a disposable one:
@@ -256,9 +256,13 @@ Requires Docker and a sandbox image containing Python and pytest (image build fi
 
 | Variable | Required | Purpose |
 |---|---|---|
-| `LLM_PROVIDER` | No (default `groq`) | Only `groq` is supported |
-| `GROQ_API_KEY` | **Yes** | Groq API key |
-| `MODEL` | No (default `openai/gpt-oss-20b`) | Groq model name |
+| `LLM_PROVIDER` | No (default `openrouter`) | OpenRouter is the only enabled provider |
+| `OPENROUTER_API_KEY` | **Yes** | OpenRouter API key |
+| `MODEL` | No (default `nvidia/nemotron-3-ultra-550b-a55b:free`) | One model shared by every agent |
+| `LLM_BASE_URL` | No | Override the OpenRouter API endpoint |
+| `LLM_MAX_CONTEXT_CHARS` / `LLM_MAX_FILE_CHARS` | No | Repository Intelligence context limits (defaults: 120,000 / 20,000) |
+| `LLM_MAX_OUTPUT_TOKENS` / `LLM_MAX_OUTPUT_TOKENS_<AGENT>` | No | Completion limit override, optionally per agent |
+| `LLM_TIMEOUT_SECONDS` / `LLM_CLIENT_RETRIES` | No | Request timeout and SDK retry settings |
 | `SECRET_KEY` | **Yes** | Signs JWT tokens — use a long random value |
 | `GITHUB_TOKEN` | For PRs | Token with repo permissions |
 | `GITHUB_OWNER` | For PRs | GitHub user/org that owns the target repo |
@@ -336,7 +340,7 @@ curl -X POST http://127.0.0.1:8000/runs/<run_id>/approve \
 
 | API | Used for |
 |---|---|
-| **Groq API** (OpenAI-compatible chat completions, via `groq` and `langchain-groq`) | Planning, repository intelligence, coding, debugging, code review |
+| **OpenRouter API** (NVIDIA Nemotron 3 Ultra) | Planning, repository intelligence, coding, debugging, code review |
 | **GitHub REST API** (`https://api.github.com`) | Creating branches, commits and pull requests |
 | **Google OAuth 2.0** | Placeholder endpoints only — not a production integration |
 
@@ -377,7 +381,7 @@ The live dashboard and background-run endpoints were additionally verified end t
 
 - Only run against repositories you own or are authorised to modify; use a disposable checkout.
 - **Local test mode executes code from the target repository on your machine.** Use Docker mode or an isolated environment for untrusted code.
-- Rate-limit handling for Groq is built into the Coder (retry/wait), but free-tier limits may still interrupt long runs.
+- Rate-limit handling is built into the Coder (retry/wait), but OpenRouter free tier limits may still interrupt long runs.
 - `run_store.json` may contain paths, requirements and generated code — keep it out of Git (add it to `.gitignore`).
 - The `/auth/google/callback` endpoint is a **development placeholder**: it issues a token without verifying the Google code. Do **not** expose it publicly.
 - The approve/reject endpoints are not currently protected by JWT roles. Add authentication before exposing the API beyond localhost.
@@ -386,7 +390,7 @@ The live dashboard and background-run endpoints were additionally verified end t
 
 ## Limitations
 
-- Output quality depends on the Groq model (the default is a small model); complex multi-file tasks may fail or need several retries.
+- Output quality depends on the selected model; complex multi-file tasks may fail or need several retries.
 - No vector search / embeddings: repository context selection is LLM-based, not RAG.
 - No database: runs are stored in a JSON file; runs execute in-process threads (no job queue).
 - Test execution is local by default; the Docker sandbox image is not yet provided.
