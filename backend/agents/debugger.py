@@ -3,7 +3,7 @@ import time
 from pathlib import Path
 
 from backend.graph.state import AgentState
-from backend.llm import get_groq_client, get_model
+from backend.llm import get_llm_client, get_model, get_output_token_limit
 from backend.tools.filesystem import read_file
 
 MAX_FILE_CONTEXT = 8_000
@@ -157,12 +157,12 @@ def is_rate_limit_error(error: Exception) -> bool:
 
 
 def call_debugger_llm(prompt: str) -> dict:
-    response = get_groq_client().chat.completions.create(
+    response = get_llm_client().chat.completions.create(
         model=get_model("debugger"),
         messages=[{"role": "system", "content": DEBUGGER_SYSTEM_PROMPT}, {"role": "user", "content": prompt}],
         temperature=0,
         reasoning_effort="low",
-        max_tokens=8_000,
+        max_tokens=get_output_token_limit(8_000, agent="debugger"),
         response_format={"type": "json_schema", "json_schema": build_debugger_schema()},
     )
     if not response.choices or not response.choices[0].message.content:

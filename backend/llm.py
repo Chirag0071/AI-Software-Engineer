@@ -1,19 +1,7 @@
 """LLM provider layer.
 
-Supported providers (set LLM_PROVIDER in .env):
-
-* ``groq``        - GROQ_API_KEY,       default model ``openai/gpt-oss-20b``
-* ``gemini``      - GEMINI_API_KEY (Google AI Studio key; GOOGLE_API_KEY also accepted),
-                    default model ``gemini-2.5-flash``
-* ``openrouter``  - OPENROUTER_API_KEY, MODEL is required (pick a model id from
-                    openrouter.ai/models; ids ending in ``:free`` use the free tier)
-
-Gemini and OpenRouter are reached through their OpenAI-compatible endpoints, so every
-agent keeps calling ``get_groq_client().chat.completions.create(...)`` unchanged.
-
-Per-agent models: set MODEL_CODER, MODEL_DEBUGGER, MODEL_PLANNER, MODEL_REVIEWER or
-MODEL_INTELLIGENCE to override MODEL for one agent (e.g. a stronger model for the Coder
-and Debugger, a cheaper one elsewhere).
+All agents use NVIDIA Nemotron 3 Ultra through OpenRouter. Set ``OPENROUTER_API_KEY``
+in ``.env``. ``MODEL`` can override the default model id for all agents.
 
 API keys are only ever read from the environment - never hard-code them.
 """
@@ -24,31 +12,24 @@ import json
 import os
 
 from dotenv import load_dotenv
-from groq import Groq
-from langchain_groq import ChatGroq
 
 load_dotenv()
 
-SUPPORTED_PROVIDERS = ("groq", "gemini", "openrouter")
+SUPPORTED_PROVIDERS = ("openrouter",)
 
 _DEFAULT_MODELS = {
-    "groq": "openai/gpt-oss-20b",
-    "gemini": "gemini-2.5-flash",
-    "openrouter": "",  # must be chosen explicitly
+    "openrouter": "nvidia/nemotron-3-ultra-550b-a55b:free",
 }
 _BASE_URLS = {
-    "gemini": "https://generativelanguage.googleapis.com/v1beta/openai/",
     "openrouter": "https://openrouter.ai/api/v1",
 }
 _KEY_VARS = {
-    "groq": ("GROQ_API_KEY",),
-    "gemini": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
     "openrouter": ("OPENROUTER_API_KEY",),
 }
 
 
 def get_provider() -> str:
-    provider = os.getenv("LLM_PROVIDER", "groq").strip().lower()
+    provider = os.getenv("LLM_PROVIDER", "openrouter").strip().lower()
     if provider not in SUPPORTED_PROVIDERS:
         raise ValueError(
             f"Unsupported LLM provider: {provider}. "
@@ -67,30 +48,52 @@ def get_api_key() -> str:
 
 
 def get_model(agent: str | None = None) -> str:
-    """Model id for an agent: MODEL_<AGENT> > MODEL > provider default."""
+    """Return one model id shared by every agent in the application."""
     provider = get_provider()
-    if agent:
-        specific = os.getenv(f"MODEL_{agent.upper()}", "").strip()
-        if specific:
-            return specific
     model = os.getenv("MODEL", "").strip() or _DEFAULT_MODELS[provider]
-    if not model:
-        raise ValueError(
-            f"MODEL is required when LLM_PROVIDER={provider}. "
-            "Pick a model id from openrouter.ai/models (ids ending in ':free' are free)."
-        )
     return model
 
 
-def get_llm():
-    """LangChain Groq client (Groq only)."""
-    if get_provider() != "groq":
-        raise ValueError("get_llm() is only available for LLM_PROVIDER=groq")
-    return ChatGroq(model=get_model(), api_key=get_api_key(), temperature=0, max_retries=3)
+def _int_setting(name: str, default: int, minimum: int = 1) -> int:
+    value = os.getenv(name, "").strip()
+    if not value:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer.") from exc
+    if parsed < minimum:
+        raise ValueError(f"{name} must be at least {minimum}.")
+    return parsed
+
+
+def get_context_char_limit() -> int:
+    """Repository context budget, configurable without changing code."""
+    return _int_setting("LLM_MAX_CONTEXT_CHARS", 120_000)
+
+
+def get_file_char_limit() -> int:
+    return _int_setting("LLM_MAX_FILE_CHARS", 20_000)
+
+
+def get_output_token_limit(default: int = 8_000, agent: str | None = None) -> int:
+    if agent:
+        specific = os.getenv(f"LLM_MAX_OUTPUT_TOKENS_{agent.upper()}", "").strip()
+        if specific:
+            return _int_setting(f"LLM_MAX_OUTPUT_TOKENS_{agent.upper()}", default)
+    return _int_setting("LLM_MAX_OUTPUT_TOKENS", default)
+
+
+def _client_timeout() -> int:
+    return _int_setting("LLM_TIMEOUT_SECONDS", 120)
+
+
+def _client_retries() -> int:
+    return _int_setting("LLM_CLIENT_RETRIES", 2, minimum=0)
 
 
 # ----------------------------------------------------------------------------
-# OpenAI-compatible adapter (Gemini / OpenRouter)
+# OpenRouter adapter
 # ----------------------------------------------------------------------------
 def clean_json_text(text: str) -> str:
     """Strip markdown fences / chatter so json.loads() can parse the reply."""
@@ -107,60 +110,36 @@ def clean_json_text(text: str) -> str:
     return text
 
 
-def _is_format_error(exc: Exception) -> bool:
-    status = getattr(exc, "status_code", None)
-    return status in (400, 422)
-
-
 class _Completions:
-    """Same call shape as ``Groq().chat.completions`` with structured-output fallbacks."""
+    """OpenAI-compatible calls with prompt-based JSON instructions.
 
-    # strict JSON schema -> plain JSON mode -> prompt-only. The first that works is cached.
-    _STRATEGIES = ("json_schema", "json_object", "prompt_only")
-    _working: dict[tuple[str, str], str] = {}
+    The configured Nemotron OpenRouter model does not support response_format, so
+    JSON schemas are included in the system prompt instead of sent as API params.
+    """
 
     def __init__(self, client, provider: str):
         self._client = client
         self._provider = provider
 
     def create(self, **kwargs):
-        if self._provider == "openrouter":
-            kwargs.pop("reasoning_effort", None)  # not an OpenRouter chat parameter
+        kwargs.pop("reasoning_effort", None)
         wanted = kwargs.get("response_format")
-        if not wanted or wanted.get("type") != "json_schema":
-            return self._client.chat.completions.create(**kwargs)
-
-        cache_key = (self._provider, str(kwargs.get("model")))
-        strategies = list(self._STRATEGIES)
-        known = self._working.get(cache_key)
-        if known:
-            strategies = strategies[strategies.index(known):]
-
-        last_exc: Exception | None = None
-        for strategy in strategies:
-            try:
-                response = self._client.chat.completions.create(**self._shape(kwargs, strategy))
-            except Exception as exc:  # noqa: BLE001
-                if _is_format_error(exc) and strategy != strategies[-1]:
-                    last_exc = exc
-                    continue
-                raise
-            self._working[cache_key] = strategy
-            self._clean(response)
-            return response
-        raise last_exc  # pragma: no cover
+        if wanted and wanted.get("type") == "json_schema":
+            kwargs = self._with_json_schema_instruction(kwargs)
+        else:
+            kwargs.pop("response_format", None)
+        response = self._client.chat.completions.create(**kwargs)
+        self._clean(response)
+        return response
 
     @staticmethod
-    def _shape(kwargs: dict, strategy: str) -> dict:
-        if strategy == "json_schema":
-            return kwargs
+    def _with_json_schema_instruction(kwargs: dict) -> dict:
         shaped = copy.deepcopy(kwargs)
         schema = (shaped.pop("response_format").get("json_schema") or {}).get("schema", {})
-        if strategy == "json_object":
-            shaped["response_format"] = {"type": "json_object"}
         instruction = (
-            "\n\nReply with ONLY one JSON object (no markdown, no commentary) that "
-            "conforms to this JSON schema:\n" + json.dumps(schema)
+            "\n\nReply with ONLY valid JSON matching this schema. Do not include "
+            "markdown, explanations, or reasoning outside the JSON object.\n"
+            + json.dumps(schema, separators=(",", ":"))
         )
         messages = shaped.get("messages", [])
         if messages and messages[0].get("role") == "system":
@@ -187,24 +166,14 @@ class _CompatClient:
         self.chat = _Chat(client, provider)
 
 
-def get_groq_client():
-    """Provider-aware client exposing ``.chat.completions.create(...)``.
-
-    (Name kept for backwards compatibility with the agents.)
-    """
+def get_llm_client():
+    """Return the configured OpenRouter chat client."""
     provider = get_provider()
-    if provider == "groq":
-        return Groq(api_key=get_api_key())
-
-    from openai import OpenAI  # imported lazily so Groq-only setups don't need it
-
+    from openai import OpenAI
     client = OpenAI(
         api_key=get_api_key(),
-        base_url=_BASE_URLS[provider],
-        max_retries=2,
-        timeout=120,
+        base_url=os.getenv("LLM_BASE_URL", "").strip() or _BASE_URLS[provider],
+        max_retries=_client_retries(),
+        timeout=_client_timeout(),
     )
     return _CompatClient(client, provider)
-
-
-get_llm_client = get_groq_client

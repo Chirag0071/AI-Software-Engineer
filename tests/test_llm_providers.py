@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-from openai import BadRequestError, RateLimitError
+from openai import RateLimitError
 
 from backend import llm
 
@@ -12,15 +12,19 @@ from backend import llm
 def clean_env(monkeypatch):
     for var in (
         "LLM_PROVIDER", "MODEL", "GROQ_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY",
-        "OPENROUTER_API_KEY", "MODEL_CODER", "MODEL_DEBUGGER",
+        "OPENROUTER_API_KEY", "LLM_API_KEY", "LLM_BASE_URL", "MODEL_CODER",
+        "MODEL_DEBUGGER", "LLM_MAX_CONTEXT_CHARS", "LLM_MAX_FILE_CHARS",
+        "LLM_MAX_OUTPUT_TOKENS", "LLM_MAX_OUTPUT_TOKENS_INTELLIGENCE",
     ):
         monkeypatch.delenv(var, raising=False)
-    llm._Completions._working.clear()
 
 
-def test_default_provider_is_groq():
-    assert llm.get_provider() == "groq"
-    assert llm.get_model() == "openai/gpt-oss-20b"
+def test_app_uses_openrouter_nemotron_for_every_agent():
+    expected = "nvidia/nemotron-3-ultra-550b-a55b:free"
+    assert llm.get_provider() == "openrouter"
+    assert llm.get_model() == expected
+    assert llm.get_model("coder") == expected
+    assert llm.get_model("intelligence") == expected
 
 
 def test_unknown_provider_rejected(monkeypatch):
@@ -29,31 +33,36 @@ def test_unknown_provider_rejected(monkeypatch):
         llm.get_provider()
 
 
-def test_missing_key_message(monkeypatch):
-    monkeypatch.setenv("LLM_PROVIDER", "gemini")
-    with pytest.raises(ValueError, match="GEMINI_API_KEY"):
+def test_missing_openrouter_key_message():
+    with pytest.raises(ValueError, match="OPENROUTER_API_KEY"):
         llm.get_api_key()
 
 
-def test_gemini_accepts_google_api_key_alias(monkeypatch):
-    monkeypatch.setenv("LLM_PROVIDER", "gemini")
-    monkeypatch.setenv("GOOGLE_API_KEY", "k")
-    assert llm.get_api_key() == "k"
-    assert llm.get_model() == "gemini-2.5-flash"
+def test_only_openrouter_is_supported(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "groq")
+    with pytest.raises(ValueError, match="Choose one of: openrouter"):
+        llm.get_provider()
 
 
-def test_openrouter_requires_model(monkeypatch):
+def test_provider_request_settings_are_configurable(monkeypatch):
     monkeypatch.setenv("LLM_PROVIDER", "openrouter")
-    with pytest.raises(ValueError, match="MODEL is required"):
-        llm.get_model()
-    monkeypatch.setenv("MODEL", "vendor/some-model:free")
-    assert llm.get_model() == "vendor/some-model:free"
+    assert llm.get_context_char_limit() == 120_000
+    monkeypatch.setenv("LLM_MAX_CONTEXT_CHARS", "70000")
+    monkeypatch.setenv("LLM_MAX_OUTPUT_TOKENS_INTELLIGENCE", "16000")
+    assert llm.get_context_char_limit() == 70_000
+    assert llm.get_output_token_limit(12_000, agent="intelligence") == 16_000
 
 
-def test_per_agent_model_override(monkeypatch):
+def test_openrouter_api_key_alias(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "openrouter")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "router-key")
+    assert llm.get_api_key() == "router-key"
+
+
+def test_single_model_is_used_even_if_agent_override_is_set(monkeypatch):
     monkeypatch.setenv("MODEL", "base-model")
     monkeypatch.setenv("MODEL_CODER", "strong-model")
-    assert llm.get_model("coder") == "strong-model"
+    assert llm.get_model("coder") == "base-model"
     assert llm.get_model("debugger") == "base-model"
     assert llm.get_model() == "base-model"
 
@@ -64,17 +73,11 @@ def test_clean_json_text_strips_fences_and_chatter():
     assert llm.clean_json_text('{"a": 3}') == '{"a": 3}'
 
 
-def test_client_factory_uses_compat_endpoint(monkeypatch):
-    monkeypatch.setenv("LLM_PROVIDER", "openrouter")
+def test_client_factory_uses_openrouter(monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "x")
-    client = llm.get_groq_client()
+    client = llm.get_llm_client()
     assert isinstance(client, llm._CompatClient)
-
-
-# ---- fallback behaviour -----------------------------------------------------
-def _bad_request():
-    req = httpx.Request("POST", "http://test")
-    return BadRequestError("bad", response=httpx.Response(400, request=req), body=None)
+    assert str(client.chat.completions._client.base_url) == "https://openrouter.ai/api/v1/"
 
 
 def _response(text):
@@ -83,16 +86,12 @@ def _response(text):
 
 
 class FakeOpenAI:
-    """Rejects the first `reject` formats, then answers."""
-
-    def __init__(self, reject, reply='```json\n{"ok": true}\n```'):
-        self.calls, self.reject, self.reply = [], reject, reply
+    def __init__(self, reply='```json\n{"ok": true}\n```'):
+        self.calls, self.reply = [], reply
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
 
     def _create(self, **kw):
         self.calls.append(kw)
-        if len(self.calls) <= self.reject:
-            raise _bad_request()
         return _response(self.reply)
 
 
@@ -104,38 +103,14 @@ KW = dict(
 )
 
 
-def test_schema_accepted_first_try_and_output_cleaned():
-    fake = FakeOpenAI(reject=0)
-    resp = llm._Completions(fake, "gemini").create(**KW)
-    assert len(fake.calls) == 1
-    assert fake.calls[0]["reasoning_effort"] == "low"  # kept for Gemini
-    assert json.loads(resp.choices[0].message.content) == {"ok": True}
-
-
-def test_openrouter_drops_reasoning_effort():
-    fake = FakeOpenAI(reject=0)
-    llm._Completions(fake, "openrouter").create(**KW)
-    assert "reasoning_effort" not in fake.calls[0]
-
-
-def test_falls_back_to_json_object_then_prompt_only():
-    fake = FakeOpenAI(reject=2)
+def test_schema_is_sent_as_prompt_instruction_and_output_cleaned():
+    fake = FakeOpenAI()
     resp = llm._Completions(fake, "openrouter").create(**KW)
-    assert [c.get("response_format", {}).get("type") for c in fake.calls] == ["json_schema", "json_object", None]
-    assert "JSON schema" in fake.calls[2]["messages"][0]["content"]
+    assert len(fake.calls) == 1
+    assert "reasoning_effort" not in fake.calls[0]
+    assert "response_format" not in fake.calls[0]
+    assert "JSON matching this schema" in fake.calls[0]["messages"][0]["content"]
     assert json.loads(resp.choices[0].message.content) == {"ok": True}
-    # original kwargs were not mutated
-    assert KW["response_format"]["type"] == "json_schema"
-
-
-def test_working_strategy_is_cached():
-    fake = FakeOpenAI(reject=1)
-    comp = llm._Completions(fake, "openrouter")
-    comp.create(**KW)
-    fake.calls.clear()
-    fake.reject = 0
-    comp.create(**KW)
-    assert len(fake.calls) == 1 and fake.calls[0]["response_format"]["type"] == "json_object"
 
 
 def test_non_format_errors_are_not_swallowed():
@@ -146,4 +121,4 @@ def test_non_format_errors_are_not_swallowed():
         chat = SimpleNamespace(completions=SimpleNamespace(create=lambda **kw: (_ for _ in ()).throw(err)))
 
     with pytest.raises(RateLimitError):
-        llm._Completions(Boom(), "gemini").create(**KW)
+        llm._Completions(Boom(), "openrouter").create(**KW)

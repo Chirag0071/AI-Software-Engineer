@@ -3,7 +3,7 @@ import time
 from pathlib import Path
 
 from backend.graph.state import AgentState
-from backend.llm import get_groq_client, get_model
+from backend.llm import get_llm_client, get_model, get_output_token_limit
 from backend.tools.filesystem import read_file, write_file
 
 
@@ -431,7 +431,7 @@ def build_coder_schema() -> dict:
 
 
 def call_coder_llm(prompt: str) -> dict:
-    client = get_groq_client()
+    client = get_llm_client()
 
     response = client.chat.completions.create(
         model=get_model("coder"),
@@ -447,7 +447,7 @@ def call_coder_llm(prompt: str) -> dict:
         ],
         temperature=0,
         reasoning_effort="low",
-        max_tokens=20_000,
+        max_tokens=get_output_token_limit(20_000, agent="coder"),
         response_format={
             "type": "json_schema",
             "json_schema": build_coder_schema(),

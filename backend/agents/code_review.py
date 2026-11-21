@@ -9,7 +9,7 @@ import json
 import time
 
 from backend.graph.state import AgentState
-from backend.llm import get_groq_client, get_model
+from backend.llm import get_llm_client, get_model, get_output_token_limit
 from backend.tools.filesystem import read_file
 
 
@@ -188,7 +188,7 @@ def build_review_context(
 
 def build_code_review_schema() -> dict:
     """
-    Strict JSON schema for the Groq structured response.
+    Strict JSON schema for the model response.
     """
 
     return {
@@ -381,10 +381,10 @@ def review_code(
     state: AgentState,
 ) -> dict:
     """
-    Send the current implementation to Groq for review.
+    Send the current implementation to OpenRouter for review.
     """
 
-    client = get_groq_client()
+    client = get_llm_client()
     model = get_model("reviewer")
 
     user_request = state.get(
@@ -466,7 +466,7 @@ Approve the implementation only if no required changes remain.
                     },
                 ],
                 temperature=0,
-                max_tokens=10_000,
+                max_tokens=get_output_token_limit(10_000, agent="reviewer"),
                 response_format={
                     "type": "json_schema",
                     "json_schema": schema,

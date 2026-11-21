@@ -5,7 +5,7 @@ import time
 
 from backend.agents.planner_models import ImplementationPlan
 from backend.graph.state import AgentState
-from backend.llm import get_groq_client, get_model
+from backend.llm import get_llm_client, get_model, get_output_token_limit
 
 
 PLANNER_SYSTEM_PROMPT = """
@@ -545,7 +545,7 @@ Before returning the structured response, verify:
         MAX_RETRIES + 1,
     ):
         try:
-            client = get_groq_client()
+            client = get_llm_client()
 
             response = client.chat.completions.create(
                 model=get_model("planner"),
@@ -561,7 +561,7 @@ Before returning the structured response, verify:
                 ],
                 temperature=0,
                 reasoning_effort="low",
-                max_tokens=12000,
+                max_tokens=get_output_token_limit(12_000, agent="planner"),
                 response_format={
                     "type": "json_schema",
                     "json_schema": build_planner_schema(),
@@ -570,7 +570,7 @@ Before returning the structured response, verify:
 
             if not response.choices:
                 raise ValueError(
-                    "Planner received no response choices from Groq."
+                    "Planner received no response choices from OpenRouter."
                 )
 
             content = (
