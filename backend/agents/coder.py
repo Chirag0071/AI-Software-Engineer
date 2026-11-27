@@ -512,7 +512,6 @@ def validate_coder_response(
             item.get("path", "")
         )
 
-        action = item.get("action")
         content = item.get("content")
 
         if path in seen:
@@ -522,20 +521,15 @@ def validate_coder_response(
 
         seen.add(path)
 
+        # Authorization is decided by PATH only. The model's own
+        # "action" label is unreliable (e.g. it says "create" for an
+        # existing empty file), so execute_task() derives the real
+        # action from what is on disk.
         if path not in allowed:
             raise ValueError(
                 f"Coder attempted to modify "
-                f"an unauthorized file: {path}"
-            )
-
-        if action == "modify" and path not in allowed_modify:
-            raise ValueError(
-                f"File is not authorized for modification: {path}"
-            )
-
-        if action == "create" and path not in allowed_create:
-            raise ValueError(
-                f"File is not authorized for creation: {path}"
+                f"an unauthorized file: {path}. "
+                f"Allowed files: {sorted(allowed)}"
             )
 
         if not isinstance(content, str) or not content.strip():
@@ -546,7 +540,7 @@ def validate_coder_response(
         validated.append(
             {
                 "path": path,
-                "action": action,
+                "action": item.get("action") or "modify",
                 "content": content,
             }
         )
@@ -559,12 +553,18 @@ def execute_task(
     task: dict,
     repair_mode: bool = False,
 ):
-    prompt = build_coder_prompt(
+    repository_path = state.get("repository_path")
+
+    if not repository_path:
+        raise ValueError("Repository path is missing.")
+
+    base_prompt = build_coder_prompt(
         state,
         task,
         repair_mode,
     )
 
+    prompt = base_prompt
     last_error = None
 
     for attempt in range(
@@ -572,35 +572,22 @@ def execute_task(
         MAX_LLM_RETRIES + 1,
     ):
         try:
-            response = call_coder_llm(
-                prompt
-            )
+            response = call_coder_llm(prompt)
 
             files = validate_coder_response(
                 response,
                 task,
             )
 
-            repository_path = state.get(
-                "repository_path"
-            )
-
-            if not repository_path:
-                raise ValueError(
-                    "Repository path is missing."
-                )
-
-            for file_data in files:
-                path = file_data["path"]
-
-                if file_data["action"] == "modify":
-                    if not Path(
-                        repository_path,
-                        path,
-                    ).exists():
-                        raise ValueError(
-                            f"File does not exist: {path}"
-                        )
+            # The real action comes from the filesystem, not from the
+            # model's label.
+            existed_before = {
+                item["path"]: Path(
+                    repository_path,
+                    item["path"],
+                ).exists()
+                for item in files
+            }
 
             for file_data in files:
                 write_file(
@@ -617,7 +604,7 @@ def execute_task(
             modified = [
                 item["path"]
                 for item in files
-                if item["action"] == "modify"
+                if existed_before[item["path"]]
             ]
 
             return generated, modified
@@ -627,6 +614,17 @@ def execute_task(
 
             if attempt == MAX_LLM_RETRIES:
                 break
+
+            # Tell the model what went wrong. Retrying the identical
+            # prompt at temperature 0 would just fail the same way.
+            prompt = (
+                base_prompt
+                + "\n\nYOUR PREVIOUS ANSWER WAS REJECTED:\n"
+                + str(exc)
+                + "\nReturn ONLY the files this task is authorized "
+                "to modify or create, using exactly the authorized "
+                "paths listed above."
+            )
 
             message = str(exc).lower()
 
