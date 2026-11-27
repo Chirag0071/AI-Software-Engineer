@@ -1,7 +1,12 @@
 """LLM provider layer.
 
-All agents use NVIDIA Nemotron 3 Ultra through OpenRouter. Set ``OPENROUTER_API_KEY``
-in ``.env``. ``MODEL`` can override the default model id for all agents.
+All agents use ONE provider/model chosen in ``.env``:
+
+    LLM_PROVIDER = openrouter | gemini | nvidia
+    MODEL        = model id for that provider (optional; sensible default)
+
+and the matching key: OPENROUTER_API_KEY, GEMINI_API_KEY (or GOOGLE_API_KEY),
+NVIDIA_API_KEY. All three speak the OpenAI-compatible chat API.
 
 API keys are only ever read from the environment - never hard-code them.
 """
@@ -15,16 +20,22 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-SUPPORTED_PROVIDERS = ("openrouter",)
+SUPPORTED_PROVIDERS = ("openrouter", "gemini", "nvidia")
 
 _DEFAULT_MODELS = {
     "openrouter": "nvidia/nemotron-3-ultra-550b-a55b:free",
+    "gemini": "gemini-3.8-flash",
+    "nvidia": "openai/gpt-oss-20b",
 }
 _BASE_URLS = {
     "openrouter": "https://openrouter.ai/api/v1",
+    "gemini": "https://generativelanguage.googleapis.com/v1beta/openai/",
+    "nvidia": "https://integrate.api.nvidia.com/v1",
 }
 _KEY_VARS = {
     "openrouter": ("OPENROUTER_API_KEY",),
+    "gemini": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
+    "nvidia": ("NVIDIA_API_KEY",),
 }
 
 
@@ -41,10 +52,12 @@ def get_provider() -> str:
 def get_api_key() -> str:
     provider = get_provider()
     for var in _KEY_VARS[provider]:
-        value = os.getenv(var)
+        value = (os.getenv(var) or "").strip()
         if value:
             return value
-    raise ValueError(f"{_KEY_VARS[provider][0]} is missing from .env")
+    raise ValueError(
+        f"{_KEY_VARS[provider][0]} is missing (needed for LLM_PROVIDER={provider})."
+    )
 
 
 def get_model(agent: str | None = None) -> str:
@@ -98,6 +111,10 @@ def _client_retries() -> int:
 def clean_json_text(text: str) -> str:
     """Strip markdown fences / chatter so json.loads() can parse the reply."""
     text = (text or "").strip()
+    # Reasoning models may prefix <think>...</think>; braces inside it would
+    # otherwise confuse the JSON extraction below.
+    if "</think>" in text:
+        text = text.split("</think>", 1)[1].strip()
     if text.startswith("```"):
         text = text.split("\n", 1)[1] if "\n" in text else text[3:]
         if text.rstrip().endswith("```"):
@@ -113,8 +130,8 @@ def clean_json_text(text: str) -> str:
 class _Completions:
     """OpenAI-compatible calls with prompt-based JSON instructions.
 
-    The configured Nemotron OpenRouter model does not support response_format, so
-    JSON schemas are included in the system prompt instead of sent as API params.
+    Not every hosted model supports response_format, so the JSON schema is put
+    in the system prompt instead of being sent as an API parameter.
     """
 
     def __init__(self, client, provider: str):
@@ -152,7 +169,17 @@ class _Completions:
     def _clean(response) -> None:
         for choice in getattr(response, "choices", []) or []:
             message = getattr(choice, "message", None)
-            if message is not None and message.content:
+            if message is None:
+                continue
+            if not message.content:
+                # Some reasoning models put the answer in a reasoning field.
+                fallback = (
+                    getattr(message, "reasoning", None)
+                    or getattr(message, "reasoning_content", None)
+                )
+                if isinstance(fallback, str) and "{" in fallback:
+                    message.content = fallback
+            if message.content:
                 message.content = clean_json_text(message.content)
 
 
@@ -167,7 +194,7 @@ class _CompatClient:
 
 
 def get_llm_client():
-    """Return the configured OpenRouter chat client."""
+    """Return the configured chat client."""
     provider = get_provider()
     from openai import OpenAI
     client = OpenAI(
