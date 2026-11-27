@@ -629,10 +629,14 @@ def validate_intelligence(
     )
 
     for field in list_fields:
-        if not isinstance(
-            data.get(field),
-            list,
-        ):
+        value = data.get(field)
+
+        # Be tolerant: models often omit or mis-type optional lists.
+        if value is None:
+            data[field] = []
+        elif isinstance(value, str):
+            data[field] = [value]
+        elif not isinstance(value, list):
             raise ValueError(
                 f"Repository Intelligence field "
                 f"{field} must be a list."
@@ -657,29 +661,22 @@ def validate_intelligence(
         "relevant_files",
         [],
     ):
-        normalized = normalize_path(path)
+        try:
+            normalized = normalize_path(path)
+        except ValueError:
+            continue
 
-        if not is_safe_path(normalized):
-            raise ValueError(
-                f"Unsafe relevant file: {normalized}"
-            )
-
-        if normalized not in available_files:
-            raise ValueError(
-                "Repository Intelligence identified a "
-                f"non-existing file: {normalized}"
-            )
-
-        if normalized not in validated_relevant_files:
-            validated_relevant_files.append(
-                normalized
-            )
+        # Drop (rather than abort on) unsafe or hallucinated paths.
+        if (
+            is_safe_path(normalized)
+            and normalized in available_files
+            and normalized not in validated_relevant_files
+        ):
+            validated_relevant_files.append(normalized)
 
     if not validated_relevant_files:
-        raise ValueError(
-            "Repository Intelligence did not identify "
-            "any relevant files."
-        )
+        # Nothing usable from the model: fall back to the whole repository.
+        validated_relevant_files = sorted(available_files)
 
     for field in (
         "source_files",
