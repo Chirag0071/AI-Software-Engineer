@@ -10,8 +10,10 @@ LangGraph workflow so they can be tested independently.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
+import re
 import subprocess
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -70,8 +72,33 @@ class GitHubClient:
 
         if config is None:
             config = self._load_config()
+            owner, repo = self._origin_owner_repo(repository_path)
+            if owner and repo:
+                # PR must target the repository that was actually cloned.
+                config.owner, config.repo = owner, repo
 
         self.config = config
+
+    @staticmethod
+    def _origin_owner_repo(repository_path: str) -> tuple[str, str]:
+        try:
+            result = subprocess.run(
+                ["git", "remote", "get-url", "origin"],
+                cwd=repository_path,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+        except Exception:
+            return "", ""
+
+        match = re.match(
+            r"^(?:https://(?:[^@/]+@)?github\.com/|git@github\.com:)"
+            r"([\w.-]+)/([\w.-]+?)(?:\.git)?/?$",
+            (result.stdout or "").strip(),
+        )
+        return (match.group(1), match.group(2)) if match else ("", "")
 
     @staticmethod
     def _load_config() -> GitHubConfig:
@@ -124,18 +151,53 @@ class GitHubClient:
                 + ", ".join(missing)
             )
 
+    def _auth_header(self) -> str:
+        raw = f"x-access-token:{self.config.token}".encode("utf-8")
+        return "AUTHORIZATION: basic " + base64.b64encode(raw).decode("ascii")
+
+    def _redact(self, text: str) -> str:
+        token = self.config.token
+        if token:
+            text = text.replace(token, "***")
+            text = text.replace(
+                base64.b64encode(f"x-access-token:{token}".encode()).decode(),
+                "***",
+            )
+        return text
+
     def _run_git(
         self,
         *args: str,
+        authenticated: bool = False,
     ) -> str:
         """
         Execute a Git command inside the target repository.
+
+        With authenticated=True the GitHub token is supplied through a
+        one-off HTTP header, so it is never written to .git/config or the
+        remote URL, and it is redacted from any error text.
         """
 
-        command = [
-            "git",
-            *args,
-        ]
+        display = ["git", *args]
+        command = ["git"]
+
+        if authenticated:
+            self.validate_config()
+            command += ["-c", f"http.extraheader={self._auth_header()}"]
+
+        command += list(args)
+
+        environment = os.environ.copy()
+        environment["GIT_TERMINAL_PROMPT"] = "0"
+        # Commits need an identity; a fresh server/container has none.
+        name = os.getenv("GIT_AUTHOR_NAME", "AI Software Engineer")
+        email = os.getenv(
+            "GIT_AUTHOR_EMAIL", "ai-software-engineer@users.noreply.github.com"
+        )
+        environment.setdefault("GIT_AUTHOR_NAME", name)
+        environment.setdefault("GIT_AUTHOR_EMAIL", email)
+        environment.setdefault("GIT_COMMITTER_NAME", name)
+        environment.setdefault("GIT_COMMITTER_EMAIL", email)
 
         try:
             result = subprocess.run(
@@ -146,6 +208,8 @@ class GitHubClient:
                 encoding="utf-8",
                 errors="replace",
                 check=False,
+                env=environment,
+                timeout=120,
             )
 
         except FileNotFoundError as exc:
@@ -155,12 +219,17 @@ class GitHubClient:
                 "in PATH."
             ) from exc
 
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"Git command timed out: {' '.join(display)}"
+            ) from exc
+
         if result.returncode != 0:
-            stderr = result.stderr.strip()
+            stderr = self._redact(result.stderr.strip())
 
             raise RuntimeError(
                 f"Git command failed: "
-                f"{' '.join(command)}\n"
+                f"{' '.join(display)}\n"
                 f"{stderr}"
             )
 
@@ -182,6 +251,9 @@ class GitHubClient:
             )
 
         return branch
+
+    def get_head_sha(self) -> str:
+        return self._run_git("rev-parse", "HEAD")
 
     def get_status(self) -> str:
         """
@@ -213,11 +285,12 @@ class GitHubClient:
                 "Invalid branch name."
             )
 
-        self._run_git(
-            "switch",
-            "-c",
-            branch_name,
-        )
+        existing = self._run_git("branch", "--list", branch_name)
+
+        if existing.strip():
+            self._run_git("switch", branch_name)
+        else:
+            self._run_git("switch", "-c", branch_name)
 
         return branch_name
 
@@ -277,9 +350,8 @@ class GitHubClient:
         """
         Push the current branch to origin.
 
-        Existing Git credential configuration is used for
-        authentication. The GitHub token is never inserted
-        into the Git remote URL.
+        The GITHUB_TOKEN is sent as a one-off HTTP header, so it is
+        never inserted into the Git remote URL or stored on disk.
         """
 
         if branch_name is None:
@@ -297,6 +369,7 @@ class GitHubClient:
             "-u",
             "origin",
             branch_name,
+            authenticated=True,
         )
 
     def prepare_branch(
@@ -434,7 +507,7 @@ class GitHubClient:
                 f"{self.config.owner}/"
                 f"{self.config.repo}/"
                 "pulls"
-                "?state=open"
+                f"?state=open&head={self.config.owner}:{branch_name}"
             ),
         )
 
