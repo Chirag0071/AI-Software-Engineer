@@ -320,14 +320,16 @@ def run_panel(run_id: str) -> None:
             gen, mod = state.get("generated_files", []), state.get("modified_files", [])
             if gen or mod:
                 html(f'<div class="rsub" style="margin-top:12px">Created: {esc(", ".join(gen) or "—")} · Modified: {esc(", ".join(mod) or "—")}</div>')
-                d = (api("GET", f"/runs/{run_id}/diff", quiet=True) or {}).get("diff", "")
+                # Skip the git diff while agents are still writing files.
+                d = "" if running else (api("GET", f"/runs/{run_id}/diff", quiet=True) or {}).get("diff", "")
                 html(diff_html(d) if d else '<div class="box">No tracked diff (new files may be untracked).</div>')
             else:
                 html('<div class="box">No changes yet…</div>')
         with t_test:
             if tr:
                 ok = tr.get("success")
-                html(f'<div style="margin-top:12px"><span class="{"badge-ok" if ok else "badge-bad"}">{"PASSING" if ok else "FAILING"}</span>'
+                label = "NO TESTS" if tr.get("no_tests_collected") else ("PASSING" if ok else "FAILING")
+                html(f'<div style="margin-top:12px"><span class="{"badge-ok" if ok else "badge-bad"}">{label}</span>'
                      f' <span class="rsub">{esc(tr.get("sandbox", "local"))} · {esc(tr.get("duration_seconds", 0))}s · exit {esc(tr.get("return_code"))}</span></div>')
                 st.code((tr.get("stdout") or "") + (tr.get("stderr") or "") or "(no output)", language="text")
             else:
