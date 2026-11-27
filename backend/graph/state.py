@@ -100,6 +100,10 @@ class AgentState(TypedDict, total=False):
     iteration_count: int
 
     review_results: ReviewResults
+    review_retry_count: int
+    max_review_retries: int
+
+    retrieved_context: list[dict]
 
     approval_result: ApprovalResult
     approval_required: bool
