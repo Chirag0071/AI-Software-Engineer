@@ -222,6 +222,17 @@ class PullRequestService:
 
         return "\n".join(lines)
 
+    def _branch_has_commit(self, branch_name: str) -> bool:
+        """True when the branch already holds a commit made by a retry."""
+        try:
+            base = self.github_client.config.base_branch
+            count = self.github_client._run_git(
+                "rev-list", "--count", f"{base}..{branch_name}"
+            )
+            return int(count or 0) > 0
+        except Exception:
+            return False
+
     def create_pr_from_approved_state(
         self,
         state: AgentState,
@@ -305,8 +316,22 @@ class PullRequestService:
 
         commit_sha = ""
 
+        # Only stage what the agents actually wrote. `git add -A` would
+        # also commit junk such as .pytest_cache.
+        if files is None:
+            files = list(
+                dict.fromkeys(
+                    [
+                        *state.get("generated_files", []),
+                        *state.get("modified_files", []),
+                    ]
+                )
+            ) or None
+
         try:
-            # Create branch.
+            self.github_client.validate_config()
+
+            # Create (or resume, when retrying a failed approval) the branch.
             self.github_client.create_branch(
                 branch_name
             )
@@ -316,28 +341,39 @@ class PullRequestService:
                 files
             )
 
-            # Verify that changes exist.
             status = self.github_client.get_status()
 
             if not status:
-                return {
-                    "status": "failed",
-                    "branch": branch_name,
-                    "commit_sha": "",
-                    "pr_number": 0,
-                    "pr_url": "",
-                    "error": (
-                        "No repository changes are "
-                        "available to commit."
-                    ),
-                }
+                # Nothing new to commit. If a previous attempt already
+                # committed but failed to push, continue from that commit.
+                already_committed = (
+                    self.github_client.get_head_sha()
+                    if self._branch_has_commit(branch_name)
+                    else ""
+                )
+
+                if not already_committed:
+                    return {
+                        "status": "failed",
+                        "branch": branch_name,
+                        "commit_sha": "",
+                        "pr_number": 0,
+                        "pr_url": "",
+                        "error": (
+                            "No repository changes are "
+                            "available to commit."
+                        ),
+                    }
+
+                commit_sha = already_committed
 
             # Commit changes.
-            commit_sha = (
-                self.github_client.commit_changes(
-                    commit_message
+            if not commit_sha:
+                commit_sha = (
+                    self.github_client.commit_changes(
+                        commit_message
+                    )
                 )
-            )
 
             # Push branch.
             self.github_client.push_branch(
