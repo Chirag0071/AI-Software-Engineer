@@ -17,6 +17,7 @@ from backend.graph.state import AgentState
 
 
 DEFAULT_MAX_DEBUG_RETRIES = 3
+DEFAULT_MAX_REVIEW_RETRIES = 2
 
 
 def add_event(
@@ -223,20 +224,109 @@ def prepare_debug_retry(
     }
 
 
+def _review_fix_files(
+    state: AgentState,
+) -> list[str]:
+    """Existing, safe files that the reviewer's issues point at."""
+    from backend.agents.coder import (
+        is_safe_relative_path,
+        normalize_path,
+    )
+    from pathlib import Path
+
+    repository_path = state.get(
+        "repository_path",
+        "",
+    )
+
+    files: list[str] = []
+
+    for issue in (
+        state.get("review_results", {}).get("issues", [])
+        or []
+    ):
+        raw = str(issue.get("file", "")).strip()
+
+        if not raw:
+            continue
+
+        try:
+            path = normalize_path(raw)
+        except ValueError:
+            continue
+
+        if (
+            is_safe_relative_path(path)
+            and repository_path
+            and Path(repository_path, path).is_file()
+            and path not in files
+        ):
+            files.append(path)
+
+    return files
+
+
 def route_code_review(
     state: AgentState,
 ) -> str:
 
-    if (
-        state.get(
-            "review_results",
-            {},
-        ).get("overall_status")
-        == "approved"
-    ):
+    review = state.get("review_results", {})
+
+    if review.get("overall_status") == "approved":
         return "human_approval"
 
+    # Reviewer asked for changes: send the issues back to the Coder
+    # (bounded), then re-test and re-review.
+    if (
+        state.get("current_step") == "code_review_complete"
+        and review.get("issues")
+        and state.get("review_retry_count", 0)
+        < state.get(
+            "max_review_retries",
+            DEFAULT_MAX_REVIEW_RETRIES,
+        )
+        and _review_fix_files(state)
+    ):
+        return "prepare_review_retry"
+
     return "end"
+
+
+def prepare_review_retry(
+    state: AgentState,
+) -> AgentState:
+    """Turn review issues into repair instructions for the Coder."""
+    review = state.get("review_results", {})
+    issues = review.get("issues", []) or []
+
+    return {
+        **state,
+        "debugger_result": {
+            "diagnosis": (
+                "Code review requested changes: "
+                + str(review.get("summary", ""))
+            ),
+            "errors": [
+                f"[{i.get('severity', '')}] {i.get('file', '')}: "
+                f"{i.get('description', '')}"
+                for i in issues
+            ],
+            "files_to_fix": _review_fix_files(state),
+            "fix_instructions": [
+                str(i.get("recommendation", ""))
+                for i in issues
+                if i.get("recommendation")
+            ],
+            "severity": "medium",
+        },
+        "review_retry_count": (
+            state.get("review_retry_count", 0) + 1
+        ),
+        "iteration_count": (
+            state.get("iteration_count", 0) + 1
+        ),
+        "current_step": "review_retry",
+    }
 
 
 def build_workflow():
@@ -296,6 +386,11 @@ def build_workflow():
     workflow.add_node(
         "prepare_debug_retry",
         prepare_debug_retry,
+    )
+
+    workflow.add_node(
+        "prepare_review_retry",
+        prepare_review_retry,
     )
 
     workflow.add_node(
@@ -387,8 +482,15 @@ def build_workflow():
         {
             "human_approval":
                 "human_approval",
+            "prepare_review_retry":
+                "prepare_review_retry",
             "end": END,
         },
+    )
+
+    workflow.add_edge(
+        "prepare_review_retry",
+        "coder",
     )
 
     workflow.add_edge(
