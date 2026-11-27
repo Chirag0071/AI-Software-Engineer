@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 
 from backend.agents.planner_models import ImplementationPlan
 from backend.graph.state import AgentState
 from backend.llm import get_llm_client, get_model, get_output_token_limit
+from backend.tools.repository import scan_repository
 
 
 PLANNER_SYSTEM_PROMPT = """
@@ -402,7 +404,7 @@ def validate_file_consistency(
             )
 
         for path in modify_files:
-            if path not in existing_files:
+            if path not in existing_files and path not in created_files:
                 raise ValueError(
                     "Planner attempted to modify a "
                     f"file that does not exist: {path}"
@@ -433,7 +435,15 @@ def validate_file_consistency(
                     "dependency."
                 )
 
-            dependency_id = int(dependency)
+            match = re.search(r"\d+", dependency)
+
+            if not match:
+                raise ValueError(
+                    f"Task {task_id} has an unreadable "
+                    f"dependency '{dependency}'."
+                )
+
+            dependency_id = int(match.group())
 
             if dependency_id >= task_id:
                 raise ValueError(
@@ -447,6 +457,64 @@ def validate_file_consistency(
                     f"Task {task_id} has invalid dependency "
                     f"'{dependency}'."
                 )
+
+
+def normalize_plan_files(
+    plan: ImplementationPlan,
+    existing_files: list[str],
+) -> ImplementationPlan:
+    """
+    Repair the most common LLM planning mistakes using the real
+    repository contents instead of failing the whole run:
+
+    - an existing file listed under files_to_create -> files_to_modify
+    - a missing file listed under files_to_modify  -> files_to_create
+    - a file in both lists                          -> whichever is true
+    - a file created again by a later task          -> modify
+    - .env / unsafe paths                           -> dropped
+    - dependencies rewritten to clean numeric strings
+    """
+
+    known = {normalize_path(p) for p in existing_files}
+
+    for task in plan.tasks:
+        modify: list[str] = []
+        create: list[str] = []
+
+        for raw in [*task.files_to_modify, *task.files_to_create]:
+            path = normalize_path(raw)
+
+            if (
+                not path
+                or path.startswith("/")
+                or ".." in path.split("/")
+                or path.split("/")[-1] == ".env"
+            ):
+                continue
+
+            if path in known:
+                if path not in modify:
+                    modify.append(path)
+            else:
+                if path not in create:
+                    create.append(path)
+
+        known.update(create)
+
+        task.files_to_modify = modify
+        task.files_to_create = create
+
+        cleaned = []
+
+        for dependency in task.dependencies:
+            match = re.search(r"\d+", str(dependency))
+
+            if match and int(match.group()) < task.id:
+                cleaned.append(str(int(match.group())))
+
+        task.dependencies = sorted(set(cleaned), key=int)
+
+    return plan
 
 
 def validate_plan(
@@ -592,6 +660,11 @@ Before returning the structured response, verify:
                 plan_data
             )
 
+            plan = normalize_plan_files(
+                plan,
+                relevant_files,
+            )
+
             validate_file_consistency(
                 plan,
                 relevant_files,
@@ -610,7 +683,10 @@ Before returning the structured response, verify:
             )
 
             prompt = f"""
-The previous planning attempt failed validation.
+The previous planning attempt failed validation with this error:
+{exc}
+
+
 
 You MUST return a complete implementation plan.
 
@@ -678,10 +754,30 @@ def planner_agent(
         state
     )
 
-    relevant_files = state.get(
-        "relevant_files",
-        [],
+    # Existence is judged against the real repository on disk, not the
+    # (possibly trimmed) list of "relevant" files chosen by the
+    # Repository Intelligence agent.
+    relevant_files = list(
+        state.get("relevant_files", [])
     )
+
+    repository_path = state.get("repository_path")
+
+    if repository_path:
+        try:
+            relevant_files = sorted(
+                {
+                    *relevant_files,
+                    *[
+                        path.replace("\\", "/")
+                        for path in scan_repository(
+                            repository_path
+                        )
+                    ],
+                }
+            )
+        except Exception:
+            pass
 
     try:
         implementation_plan = generate_plan(
