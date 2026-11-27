@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import base64
+import hmac
 import os
 import re
+import shutil
 import subprocess
 import tempfile
+import threading
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
@@ -80,35 +84,70 @@ def load_run_store() -> dict[str, AgentState]:
         return {}
 
 
+_STORE_LOCK = threading.RLock()
+
+
 def save_run_store() -> None:
     """
     Persist all current run states to disk.
 
-    A temporary file is used so that an interrupted
-    write does not normally destroy the existing store.
+    Guarded by a lock: the background run thread and the request
+    handlers all save, and they must not interleave writes to the
+    same temporary file or iterate the dict while it changes.
     """
-    temporary_file = RUN_STORE_FILE.with_suffix(".tmp")
+    with _STORE_LOCK:
+        temporary_file = RUN_STORE_FILE.with_suffix(".tmp")
 
-    try:
-        temporary_file.write_text(
-            json.dumps(
-                RUN_STORE,
-                indent=2,
-                ensure_ascii=False,
-                default=str,
-            ),
-            encoding="utf-8",
-        )
+        try:
+            temporary_file.write_text(
+                json.dumps(
+                    dict(RUN_STORE),
+                    indent=2,
+                    ensure_ascii=False,
+                    default=str,
+                ),
+                encoding="utf-8",
+            )
 
-        temporary_file.replace(RUN_STORE_FILE)
+            temporary_file.replace(RUN_STORE_FILE)
 
-    except OSError as exc:
-        raise RuntimeError(
-            f"Unable to persist run store: {exc}"
-        ) from exc
+        except OSError as exc:
+            raise RuntimeError(
+                f"Unable to persist run store: {exc}"
+            ) from exc
 
 
-RUN_STORE: dict[str, AgentState] = load_run_store()
+# Steps that mean "a worker was in the middle of this run". After a
+# server restart no worker exists any more, so such runs are marked failed
+# instead of showing "running" forever.
+_IN_FLIGHT_STEPS = {
+    "starting",
+    "repository_analysis_complete",
+    "repository_intelligence_complete",
+    "planning_complete",
+    "coding_complete",
+    "testing_complete",
+    "debugging_complete",
+    "debug_retry",
+    "review_retry",
+}
+
+
+def _mark_interrupted(store: dict) -> dict:
+    for state in store.values():
+        if (
+            isinstance(state, dict)
+            and state.get("current_step") in _IN_FLIGHT_STEPS
+        ):
+            state["current_step"] = "workflow_failed"
+            state["errors"] = [
+                *state.get("errors", []),
+                "Run was interrupted by a server restart. Start a new run.",
+            ]
+    return store
+
+
+RUN_STORE: dict[str, AgentState] = _mark_interrupted(load_run_store())
 
 
 # ---------------------------------------------------------------------------
@@ -661,7 +700,12 @@ def approve_run(
             detail="Run not found.",
         )
 
-    if state.get("current_step") != "waiting_for_human_approval":
+    # "github_pr_failed" is allowed so a transient GitHub/network/token
+    # problem can be fixed and the approval retried.
+    if state.get("current_step") not in {
+        "waiting_for_human_approval",
+        "github_pr_failed",
+    }:
         raise HTTPException(
             status_code=409,
             detail="Run is not waiting for human approval.",
@@ -863,6 +907,10 @@ def _execute_run(run_id: str) -> None:
     try:
         for snapshot in workflow.stream(RUN_STORE[run_id], stream_mode="values"):
             RUN_STORE[run_id] = snapshot
+            try:
+                save_run_store()  # progress survives a restart
+            except Exception:
+                pass
     except Exception as exc:
         state = dict(RUN_STORE.get(run_id, {}))
         state["current_step"] = "workflow_failed"
@@ -879,10 +927,26 @@ def _execute_run(run_id: str) -> None:
 @app.post("/run/start")
 def start_run(request: TaskRequest):
     """Start a run in the background and return its id immediately."""
+    requirement = request.requirement.strip()
+    repository_value = request.repository_path.strip()
+
+    if not requirement or not repository_value:
+        raise HTTPException(
+            status_code=400,
+            detail="Requirement and repository path are required.",
+        )
+
     run_id = str(uuid4())
-    repository = _resolve_repository(request.repository_path.strip(), run_id)
+    repository = _resolve_repository(repository_value, run_id)
+
+    if not Path(repository).is_dir():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Repository path does not exist on the server: {repository}",
+        )
+
     RUN_STORE[run_id] = _initial_state(
-        request.requirement.strip(),
+        requirement,
         repository,
         request.max_debug_retries,
     )
@@ -924,10 +988,14 @@ def get_run_full(run_id: str):
 @app.middleware("http")
 async def require_api_key(request: Request, call_next):
     """If APP_API_KEY is set, every non-public endpoint needs header X-API-Key."""
-    expected = os.getenv("APP_API_KEY", "")
+    # .strip(): a trailing space/newline pasted into a dashboard field is the
+    # most common reason for a "valid" key being rejected.
+    expected = os.getenv("APP_API_KEY", "").strip()
     if expected and request.url.path not in _OPEN_PATHS:
-        if request.headers.get("x-api-key") != expected:
-            return JSONResponse({"detail": "Invalid or missing API key."}, status_code=401)
+        supplied = request.headers.get("x-api-key", "").strip()
+        if not hmac.compare_digest(supplied.encode(), expected.encode()):
+            reason = "missing" if not supplied else "does not match the backend's APP_API_KEY"
+            return JSONResponse({"detail": f"Invalid or missing API key ({reason})."}, status_code=401)
     return await call_next(request)
 
 
@@ -939,14 +1007,43 @@ def _resolve_repository(value: str, run_id: str) -> str:
         raise HTTPException(status_code=400, detail="Only https://github.com/<owner>/<repo> URLs are supported.")
     target = Path(tempfile.gettempdir()) / "ai-swe-workspaces" / run_id
     target.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        subprocess.run(
-            ["git", "clone", "--depth", "1", "--", value, str(target)],
-            check=True, capture_output=True, text=True, timeout=120,
+
+    token = os.getenv("GITHUB_TOKEN", "").strip()
+    environment = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+
+    # 1) anonymous (works for public repos, and is not broken by a bad token)
+    # 2) with the token as a one-off header (needed for private repos)
+    attempts: list[list[str]] = [["git", "clone", "--", value, str(target)]]
+    if token:
+        raw = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+        attempts.append(
+            ["git", "-c", f"http.extraheader=AUTHORIZATION: basic {raw}",
+             "clone", "--", value, str(target)]
         )
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-        raise HTTPException(status_code=400, detail=f"Could not clone repository: {getattr(exc, 'stderr', exc)}")
-    return str(target)
+
+    detail = ""
+    for command in attempts:
+        try:
+            subprocess.run(
+                command, check=True, capture_output=True, text=True,
+                timeout=180, env=environment,
+            )
+            return str(target)
+        except subprocess.CalledProcessError as exc:
+            detail = exc.stderr or str(exc)
+            if token:
+                detail = detail.replace(token, "***")
+            shutil.rmtree(target, ignore_errors=True)  # clean partial clone
+        except subprocess.TimeoutExpired:
+            shutil.rmtree(target, ignore_errors=True)
+            raise HTTPException(status_code=400, detail="Could not clone repository: timed out.")
+
+    hint = (
+        " (If the repo is private, check that GITHUB_TOKEN is valid and has access.)"
+        if token else
+        " (If the repo is private, set GITHUB_TOKEN.)"
+    )
+    raise HTTPException(status_code=400, detail=f"Could not clone repository: {detail.strip()}{hint}")
 
 
 @app.get("/runs/{run_id}/diff")
@@ -956,9 +1053,18 @@ def get_run_diff(run_id: str):
     if state is None:
         raise HTTPException(status_code=404, detail="Run not found.")
     repo = state.get("repository_path", "")
+    files = list(
+        dict.fromkeys(
+            [*state.get("generated_files", []), *state.get("modified_files", [])]
+        )
+    )
+    if not repo or not files:
+        return {"diff": "", "error": ""}
     try:
-        subprocess.run(["git", "-C", repo, "add", "-N", "."], capture_output=True, timeout=20)
-        out = subprocess.run(["git", "-C", repo, "diff", "HEAD"], capture_output=True, text=True, timeout=20)
+        # -N marks brand-new files as "intent to add" so they appear in the
+        # diff. Limited to this run's files (not .pytest_cache and friends).
+        subprocess.run(["git", "-C", repo, "add", "-N", "--", *files], capture_output=True, timeout=20)
+        out = subprocess.run(["git", "-C", repo, "diff", "HEAD", "--", *files], capture_output=True, text=True, timeout=20)
         return {"diff": out.stdout, "error": out.stderr}
     except Exception as exc:  # noqa: BLE001
         return {"diff": "", "error": str(exc)}
