@@ -507,6 +507,39 @@ Approve the implementation only if no required changes remain.
     )
 
 
+MINOR_SEVERITIES = {"low", "info", "minor", "nit", "suggestion", "style"}
+
+
+def relax_minor_review(result: dict) -> dict:
+    """
+    LLM reviewers often answer "changes_requested" for purely cosmetic
+    suggestions. If every issue is minor and there are no security
+    concerns, treat the review as approved: the human approval step is
+    still the final gate and sees the suggestions.
+    """
+    issues = result.get("issues") or []
+
+    if (
+        result.get("overall_status") == "changes_requested"
+        and issues
+        and not result.get("security_concerns")
+        and all(
+            str(i.get("severity", "")).strip().lower() in MINOR_SEVERITIES
+            for i in issues
+        )
+    ):
+        return {
+            **result,
+            "overall_status": "approved",
+            "summary": (
+                str(result.get("summary", ""))
+                + " (Only minor suggestions remain; passed to human review.)"
+            ).strip(),
+        }
+
+    return result
+
+
 def code_review_agent(
     state: AgentState,
 ) -> AgentState:
@@ -544,6 +577,8 @@ def code_review_agent(
         review_result = review_code(
             state
         )
+
+        review_result = relax_minor_review(review_result)
 
         return {
             **state,
