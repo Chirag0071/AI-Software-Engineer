@@ -11,6 +11,44 @@ TEST_TIMEOUT_SECONDS = int(os.getenv("TEST_TIMEOUT_SECONDS", "120"))
 DOCKER_IMAGE = os.getenv("SANDBOX_DOCKER_IMAGE", "ai-software-engineer-sandbox:latest")
 
 
+# pytest exit code 5 = "no tests were collected". For a static HTML/JS repo the
+# AI may legitimately produce no Python tests; this is reported, not fatal.
+NO_TESTS_COLLECTED = 5
+
+_SECRET_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL")
+
+
+def safe_environment(root: Path) -> dict:
+    """Environment for running AI-generated code: no API keys or tokens."""
+    environment = {
+        name: value
+        for name, value in os.environ.items()
+        if not any(marker in name.upper() for marker in _SECRET_MARKERS)
+    }
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    environment["PYTHONPATH"] = str(root)
+    return environment
+
+
+def _finish(result, command, started, sandbox: str) -> dict:
+    stdout = result.stdout
+    code = result.returncode
+    ok = code == 0 or code == NO_TESTS_COLLECTED
+
+    if code == NO_TESTS_COLLECTED:
+        stdout = (
+            "NOTE: pytest collected no tests, so nothing was verified "
+            "automatically. Review the changes manually.\n" + (stdout or "")
+        )
+
+    outcome = build_result(
+        ok, code, stdout, result.stderr, command,
+        time.perf_counter() - started, sandbox,
+    )
+    outcome["no_tests_collected"] = code == NO_TESTS_COLLECTED
+    return outcome
+
+
 def build_result(
     success: bool,
     return_code: int,
@@ -86,15 +124,13 @@ def run_tests(repository_path: str, sandbox: str | None = None, test_targets: li
 
 
 def run_local(root: Path, test_targets: list[str] | None = None) -> dict:
-    environment = os.environ.copy()
-    environment["PYTHONDONTWRITEBYTECODE"] = "1"
-    environment["PYTHONPATH"] = str(root)
+    environment = safe_environment(root)
     command = [sys.executable, "-m", "pytest", "-q", *(test_targets or [])]
     started = time.perf_counter()
 
     try:
         result = subprocess.run(command, cwd=root, env=environment, capture_output=True, text=True, timeout=TEST_TIMEOUT_SECONDS, check=False)
-        return build_result(result.returncode == 0, result.returncode, result.stdout, result.stderr, command, time.perf_counter() - started, "local")
+        return _finish(result, command, started, "local")
     except subprocess.TimeoutExpired:
         return build_result(False, -1, stderr=f"Test execution timed out after {TEST_TIMEOUT_SECONDS} seconds.", command=command, duration=time.perf_counter() - started, sandbox="local")
     except OSError as exc:
@@ -114,7 +150,7 @@ def run_docker(root: Path, test_targets: list[str] | None = None) -> dict:
 
     try:
         result = subprocess.run(command, capture_output=True, text=True, timeout=TEST_TIMEOUT_SECONDS + 30, check=False)
-        return build_result(result.returncode == 0, result.returncode, result.stdout, result.stderr, command, time.perf_counter() - started, "docker")
+        return _finish(result, command, started, "docker")
     except subprocess.TimeoutExpired:
         return build_result(False, -1, stderr=f"Docker test execution timed out after {TEST_TIMEOUT_SECONDS + 30} seconds.", command=command, duration=time.perf_counter() - started, sandbox="docker")
     except OSError as exc:
